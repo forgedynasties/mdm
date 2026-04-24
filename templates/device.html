@@ -2,7 +2,7 @@
 <div class="stats-grid"
   id="device-stats"
   hx-get="/devices/{{.Device.SerialNumber}}/stats"
-  hx-trigger="every 30s"
+  hx-trigger="device-updated from:body, every 180s"
   hx-swap="outerHTML">
   <div class="stat-card">
     <div class="stat-label">Battery</div>
@@ -48,10 +48,10 @@
     {{end}}
   </div>
   <div class="stat-card">
-    <div class="stat-label">Device Time</div>
-    {{$dtime := deviceTime .Device.LatestExtra}}
-    {{if $dtime}}
-      <div class="stat-value">{{$dtime}}</div>
+    <div class="stat-label">Timezone</div>
+    {{$tz := extraField .Device.LatestExtra "timezone"}}
+    {{if $tz}}
+      <div class="stat-value mono small">{{$tz}}</div>
     {{else}}
       <div class="stat-value muted">—</div>
     {{end}}
@@ -75,13 +75,17 @@
   id="device-commands"
   {{if $hasPending}}
   hx-get="/devices/{{.Device.SerialNumber}}/commands-status"
-  hx-trigger="every 5s"
+  hx-trigger="device-updated from:body, every 60s"
   hx-swap="outerHTML"
   {{end}}>
-  <div class="card-header">
-    <h3>Commands</h3>
-    <span class="muted small">{{len .Commands}} total{{if $hasPending}} · refreshing…{{end}}</span>
+  <div class="card-header collapsible-header" onclick="toggleSection(this)" style="cursor:pointer;user-select:none;">
+    <div style="display:flex;align-items:center;gap:8px;">
+      <span class="collapse-arrow">▶</span>
+      <h3>Commands</h3>
+      <span class="muted small">{{len .Commands}} total{{if $hasPending}} · refreshing…{{end}}</span>
+    </div>
   </div>
+  <div class="collapsible-body" style="display:none;">
   <table class="table">
     <thead>
       <tr>
@@ -110,6 +114,7 @@
       {{end}}
     </tbody>
   </table>
+  </div>
 </div>
 {{end}}
 
@@ -117,12 +122,16 @@
 <div class="card"
   id="device-checkins"
   hx-get="/devices/{{.Device.SerialNumber}}/checkins-live?page={{.CheckinPage}}"
-  hx-trigger="every 30s"
+  hx-trigger="device-updated from:body, every 300s"
   hx-swap="outerHTML">
-  <div class="card-header">
-    <h3>Checkin History</h3>
-    <span class="muted small">{{.CheckinTotal}} total</span>
+  <div class="card-header collapsible-header" onclick="toggleSection(this)" style="cursor:pointer;user-select:none;">
+    <div style="display:flex;align-items:center;gap:8px;">
+      <span class="collapse-arrow">▶</span>
+      <h3>Checkin History</h3>
+      <span class="muted small">{{.CheckinTotal}} total</span>
+    </div>
   </div>
+  <div class="collapsible-body" style="display:none;">
   <table class="table">
     <thead>
       <tr>
@@ -174,6 +183,7 @@
     {{end}}
   </div>
   {{end}}
+  </div>
 </div>
 {{end}}
 
@@ -188,9 +198,9 @@
     <div style="display:flex;align-items:center;gap:10px;">
       <h2 class="page-title mono" style="margin:0;">{{.Device.SerialNumber}}</h2>
       {{if .Online}}
-        <span id="ws-badge" class="ws-badge online" hx-get="/devices/{{.Device.SerialNumber}}/ws-status" hx-trigger="every 5s" hx-swap="outerHTML" title="WebSocket connected"><span class="ws-dot"></span>online</span>
+        <span id="ws-badge" class="ws-badge online" title="WebSocket connected"><span class="ws-dot"></span>online</span>
       {{else}}
-        <span id="ws-badge" class="ws-badge offline" hx-get="/devices/{{.Device.SerialNumber}}/ws-status" hx-trigger="every 5s" hx-swap="outerHTML" title="No WebSocket connection"><span class="ws-dot"></span>offline</span>
+        <span id="ws-badge" class="ws-badge offline" title="No WebSocket connection"><span class="ws-dot"></span>offline</span>
       {{end}}
     </div>
   </div>
@@ -207,7 +217,6 @@
     <h3>Device Graphs</h3>
     <div style="display:flex;align-items:center;gap:10px;">
       <span id="chart-info" class="muted small"></span>
-      <span id="chart-hover-info" class="chart-hover-info">Hover a point to inspect values</span>
       <div class="dur-btns">
         <button class="dur-btn" data-ms="3600000">1h</button>
         <button class="dur-btn active" data-ms="21600000">6h</button>
@@ -226,24 +235,59 @@
       <a id="csv-export" href="/devices/{{.Device.SerialNumber}}/battery.csv?hours=6" class="btn-outline" style="font-size:12px;padding:4px 10px;"><span class="ui-icon"><svg viewBox="0 0 24 24"><path d="M12 3v12"/><path d="M7 10l5 5 5-5"/><path d="M5 21h14"/></svg></span>Export CSV</a>
     </div>
   </div>
-  <div style="padding:0 16px;">
-    <div class="chart-legend">
-      <span class="chart-legend-item"><span class="chart-legend-line" style="background:#e84393;"></span> Wireless Charging On</span>
-      <span class="chart-legend-item"><span class="chart-legend-line" style="background:#6c5ce7;"></span> Wireless Charging Off</span>
-      <span class="chart-legend-item"><span class="chart-legend-line" style="height:0;border-top:2px dashed #7a7f9a;"></span> Draining</span>
-      <span class="chart-legend-item"><span class="chart-legend-line command-marker"></span> Command Sent</span>
+  <div class="chart-tabs">
+    <button class="chart-tab active" data-chart-tab="battery" onclick="setChartTab('battery')">
+      <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" style="vertical-align:-2px;margin-right:5px;"><rect x="2" y="8" width="16" height="8" rx="2"/><path d="M20 11v2"/><path d="M6 12h4"/></svg>Battery
+    </button>
+    <button class="chart-tab" data-chart-tab="temp" onclick="setChartTab('temp')">
+      <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" style="vertical-align:-2px;margin-right:5px;"><path d="M14 14.76V4a2 2 0 0 0-4 0v10.76a4 4 0 1 0 4 0z"/></svg>Temp
+    </button>
+    <button class="chart-tab" data-chart-tab="ram" onclick="setChartTab('ram')">
+      <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" style="vertical-align:-2px;margin-right:5px;"><rect x="2" y="6" width="20" height="12" rx="2"/><path d="M6 12h.01M10 12h.01M14 12h.01M18 12h.01M8 6V4M12 6V4M16 6V4M8 18v2M12 18v2M16 18v2"/></svg>RAM
+    </button>
+    <button class="chart-tab" data-chart-tab="all" onclick="setChartTab('all')">
+      <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" style="vertical-align:-2px;margin-right:5px;"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>All
+    </button>
+  </div>
+
+  <!-- Battery -->
+  <div id="chart-panel-battery">
+    <div style="padding:8px 16px 0;">
+      <div class="chart-legend">
+        <span class="chart-legend-item"><span class="chart-legend-line" style="background:#e84393;"></span> WLC On</span>
+        <span class="chart-legend-item"><span class="chart-legend-line" style="background:#6c5ce7;"></span> WLC Off</span>
+        <span class="chart-legend-item"><span class="chart-legend-line" style="height:0;border-top:2px dashed #7a7f9a;"></span> Draining</span>
+        <span class="chart-legend-item"><span class="chart-legend-line command-marker"></span> Command</span>
+      </div>
     </div>
+    <div class="chart-wrap chart-wrap--tall"><canvas id="batteryChart"></canvas></div>
   </div>
-  <div class="chart-wrap">
-    <canvas id="batteryChart"></canvas>
+
+  <!-- Temp -->
+  <div id="chart-panel-temp" style="display:none;">
+    <div class="chart-wrap chart-wrap--tall"><canvas id="tempChart"></canvas></div>
   </div>
-  <div style="padding:0 16px;"><h4 style="margin:8px 0 4px;font-size:13px;color:var(--muted);">Temperature</h4></div>
-  <div class="chart-wrap">
-    <canvas id="tempChart"></canvas>
+
+  <!-- RAM -->
+  <div id="chart-panel-ram" style="display:none;">
+    <div class="chart-wrap chart-wrap--tall"><canvas id="ramChart"></canvas></div>
   </div>
-  <div style="padding:0 16px;"><h4 style="margin:8px 0 4px;font-size:13px;color:var(--muted);">RAM Usage</h4></div>
-  <div class="chart-wrap">
-    <canvas id="ramChart"></canvas>
+
+  <!-- All (unified) -->
+  <div id="chart-panel-all" style="display:none;">
+    <div style="padding:8px 16px 0;">
+      <div class="chart-legend">
+        <span class="chart-legend-item"><span class="chart-legend-line" style="background:#6387d2;"></span> Battery %</span>
+        <span class="chart-legend-item"><span class="chart-legend-line" style="background:#ff9800;"></span> Temp °C</span>
+        <span class="chart-legend-item"><span class="chart-legend-line" style="background:#4caf50;"></span> RAM %</span>
+        <span class="chart-legend-item"><span class="chart-legend-line command-marker"></span> Command</span>
+      </div>
+    </div>
+    <div class="chart-wrap chart-wrap--tall"><canvas id="unifiedChart"></canvas></div>
+  </div>
+
+  <div id="chart-footer" style="border-top:1px solid var(--border);padding:7px 16px;font-size:12px;color:var(--muted);min-height:32px;font-variant-numeric:tabular-nums;">
+    <span id="chart-footer-text">—</span>
   </div>
 </div>
 
@@ -257,9 +301,11 @@
 
   let currentDuration = 6 * 3600 * 1000;
   let customMin = null, customMax = null;
-  let batteryChart, tempChart, ramChart;
+  let batteryChart, tempChart, ramChart, unifiedChart;
   let storedMarkerPref = localStorage.getItem(markerStorageKey);
   let showMarkers = storedMarkerPref === null ? false : storedMarkerPref === 'visible';
+  const tabStorageKey = 'mdm-chart-tab:{{.Device.SerialNumber}}';
+  let activeTab = localStorage.getItem(tabStorageKey) || 'battery';
 
   function fmtTime(ms) {
     return new Date(ms).toLocaleTimeString([], {hour: "2-digit", minute: "2-digit"});
@@ -280,6 +326,17 @@
     return { pts: all.filter(p => p.x >= minX), minX, lastX };
   }
 
+  window.setChartTab = function setChartTab(tab) {
+    activeTab = tab;
+    localStorage.setItem(tabStorageKey, tab);
+    ['battery','temp','ram','all'].forEach(function(t) {
+      document.getElementById('chart-panel-' + t).style.display = t === tab ? '' : 'none';
+      var btn = document.querySelector('[data-chart-tab="' + t + '"]');
+      if (btn) btn.classList.toggle('active', t === tab);
+    });
+    if (tab === 'all' && unifiedChart) applyUnifiedData();
+  };
+
   function applyData(chart, all) {
     const { pts, minX, lastX } = filterWindow(all);
     chart.data.datasets[0].data = pts;
@@ -290,6 +347,17 @@
 
   function fmtDate(ms) {
     return new Date(ms).toLocaleDateString([], {month: "short", day: "numeric"}) + " " + fmtTime(ms);
+  }
+
+  function applyUnifiedData() {
+    if (!unifiedChart) return;
+    const { pts: bPts, minX, lastX } = filterWindow(allBattery);
+    unifiedChart.data.datasets[0].data = bPts;
+    unifiedChart.data.datasets[1].data = filterWindow(allTemp).pts;
+    unifiedChart.data.datasets[2].data = filterWindow(allRam).pts;
+    unifiedChart.options.scales.x.min = minX;
+    unifiedChart.options.scales.x.max = lastX;
+    unifiedChart.update('none');
   }
 
   function updateCharts() {
@@ -306,14 +374,36 @@
     if (batteryChart) applyData(batteryChart, allBattery);
     if (tempChart) applyData(tempChart, allTemp);
     if (ramChart) applyData(ramChart, allRam);
+    applyUnifiedData();
     syncMarkerToggle();
   }
 
-  function setHoverInfo(text) {
-    var el = document.getElementById("chart-hover-info");
-    if (!el) return;
-    el.textContent = text || "Hover a point to inspect values";
+  function nearestInArray(arr, ms) {
+    if (!arr || !arr.length) return null;
+    let best = null, bestDist = Infinity;
+    for (let i = 0; i < arr.length; i++) {
+      const d = Math.abs(arr[i].x - ms);
+      if (d < bestDist) { bestDist = d; best = arr[i]; }
+    }
+    return best;
   }
+
+  function updateFooter(ms, markerText) {
+    const el = document.getElementById('chart-footer-text');
+    if (!el) return;
+    if (ms == null) { el.textContent = '—'; return; }
+    const bPt = nearestInArray(allBattery, ms);
+    const tPt = nearestInArray(allTemp, ms);
+    const rPt = nearestInArray(allRam, ms);
+    const parts = [fmtDate(ms)];
+    if (bPt != null) parts.push('Battery: ' + bPt.y + '%');
+    if (tPt != null) parts.push('Temp: ' + tPt.y.toFixed(1) + '°C');
+    if (rPt != null) parts.push('RAM: ' + rPt.y.toFixed(1) + '%');
+    if (markerText) parts.push(markerText);
+    el.textContent = parts.join('  ·  ');
+  }
+
+  function setHoverInfo(data) { /* replaced by updateFooter */ }
 
   function syncMarkerToggle() {
     var btn = document.getElementById('toggle-markers-btn');
@@ -444,9 +534,10 @@
   };
 
   // Find nearest data point by x pixel position
-  function nearestByPixel(chart) {
+  function nearestByPixel(chart, datasetIndex) {
     if (chart._crosshairX == null) return null;
-    const data = chart.data.datasets[0].data;
+    const idx = datasetIndex || 0;
+    const data = chart.data.datasets[idx] ? chart.data.datasets[idx].data : [];
     if (!data.length) return null;
     const xScale = chart.scales.x;
     const cursorVal = xScale.getValueForPixel(chart._crosshairX);
@@ -458,24 +549,13 @@
     return best;
   }
 
-  // Hover label plugin — writes nearest point info into the header instead of painting over the chart
   const staticLabelPlugin = {
     id: 'staticLabel',
     afterEvent(chart) {
-      const pt = nearestByPixel(chart);
-      const markerText = markerHoverText(chart);
-      if (!pt || !chart._labelFn) {
-        if (chart._crosshairX == null) {
-          setHoverInfo("");
-        } else if (markerText) {
-          setHoverInfo(markerText);
-        }
-        return;
-      }
-
-      var text = fmtDate(pt.x) + "  |  " + chart._labelFn(pt);
-      if (markerText) text += "  |  " + markerText;
-      setHoverInfo(text);
+      if (chart._crosshairX == null) { updateFooter(null); return; }
+      const xScale = chart.scales.x;
+      const ms = xScale.getValueForPixel(chart._crosshairX);
+      updateFooter(ms, markerHoverText(chart));
     },
   };
 
@@ -554,7 +634,7 @@
       }],
     },
     options: {
-      responsive: true, maintainAspectRatio: false, clip: false,
+      animation: false, responsive: true, maintainAspectRatio: false, clip: false,
       events: ['mousemove', 'mouseout'],
       interaction: { mode: "nearest", intersect: false, axis: "x" },
       plugins: {
@@ -574,6 +654,7 @@
     return line + (pt.wlc ? ' ⚡ WLC On' : ' — WLC Off');
   };
   batteryChart._commandMarkers = commandMarkers;
+  batteryChart._accent = 'battery';
 
   // Temperature chart
   tempChart = new Chart(document.getElementById("tempChart").getContext("2d"), {
@@ -602,7 +683,7 @@
       }],
     },
     options: {
-      responsive: true, maintainAspectRatio: false, clip: false,
+      animation: false, responsive: true, maintainAspectRatio: false, clip: false,
       events: ['mousemove', 'mouseout'],
       interaction: { mode: "nearest", intersect: false, axis: "x" },
       plugins: {
@@ -616,8 +697,9 @@
     },
     plugins: [crosshairPlugin, staticLabelPlugin, commandMarkerPlugin],
   });
-  tempChart._labelFn = pt => pt.y.toFixed(1) + '°C';
+  tempChart._labelFn = pt => 'Temp: ' + pt.y.toFixed(1) + '°C';
   tempChart._commandMarkers = commandMarkers;
+  tempChart._accent = 'temp';
 
   // RAM chart
   ramChart = new Chart(document.getElementById("ramChart").getContext("2d"), {
@@ -646,7 +728,7 @@
       }],
     },
     options: {
-      responsive: true, maintainAspectRatio: false, clip: false,
+      animation: false, responsive: true, maintainAspectRatio: false, clip: false,
       events: ['mousemove', 'mouseout'],
       interaction: { mode: "nearest", intersect: false, axis: "x" },
       plugins: {
@@ -662,6 +744,72 @@
   });
   ramChart._labelFn = pt => 'RAM: ' + pt.y.toFixed(1) + '%';
   ramChart._commandMarkers = commandMarkers;
+  ramChart._accent = 'ram';
+
+  // ── Unified chart ────────────────────────────────────────────────────────
+  // Reuse the same linear ms-timestamp x-axis the individual charts use
+  const unifiedXCfg = {
+    type: 'linear',
+    grid: { color: 'rgba(255,255,255,0.05)', drawBorder: false },
+    ticks: {
+      color: '#7a7f9a', maxTicksLimit: 8, font: { size: 11 },
+      callback: v => fmtDate(v),
+    },
+    border: { display: false },
+  };
+
+  unifiedChart = new Chart(document.getElementById('unifiedChart').getContext('2d'), {
+    type: 'line',
+    data: {
+      datasets: [
+        {
+          label: 'Battery %', data: [], yAxisID: 'yPct',
+          borderColor: '#6387d2', backgroundColor: 'rgba(99,135,210,0.12)',
+          borderWidth: 1.5, pointRadius: 0, spanGaps: true, tension: 0,
+          fill: false,
+        },
+        {
+          label: 'Temp °C', data: [], yAxisID: 'yTemp',
+          borderColor: '#ff9800', backgroundColor: 'transparent',
+          borderWidth: 1.5, pointRadius: 0, spanGaps: true, tension: 0,
+        },
+        {
+          label: 'RAM %', data: [], yAxisID: 'yPct',
+          borderColor: '#4caf50', backgroundColor: 'transparent',
+          borderWidth: 1.5, pointRadius: 0, spanGaps: true, tension: 0,
+          borderDash: [4, 3],
+        },
+      ],
+    },
+    options: {
+      animation: false, responsive: true, maintainAspectRatio: false, clip: false,
+      interaction: { mode: 'index', intersect: false },
+      plugins: {
+        legend: { display: false },
+        tooltip: { enabled: false },
+        decimation: { enabled: true, algorithm: 'lttb', samples: 250 },
+      },
+      scales: {
+        x: unifiedXCfg,
+        yPct: {
+          position: 'left', min: 0, max: 100,
+          grid: { color: 'rgba(255,255,255,0.05)', drawBorder: false },
+          ticks: { color: '#7a7f9a', font: { size: 11 }, callback: v => v + '%', maxTicksLimit: 5 },
+          border: { display: false },
+        },
+        yTemp: {
+          position: 'right',
+          grid: { drawOnChartArea: false },
+          ticks: { color: '#ff9800', font: { size: 11 }, callback: v => v + '°', maxTicksLimit: 5 },
+          border: { display: false },
+        },
+      },
+    },
+    plugins: [crosshairPlugin, staticLabelPlugin, commandMarkerPlugin],
+  });
+  unifiedChart._isUnified = true;
+  unifiedChart._commandMarkers = commandMarkers;
+  unifiedChart._accent = 'battery';
 
   document.getElementById("toggle-markers-btn").addEventListener("click", function () {
     showMarkers = !showMarkers;
@@ -670,6 +818,7 @@
     batteryChart.update();
     tempChart.update();
     ramChart.update();
+    unifiedChart.update();
   });
 
   document.querySelectorAll(".dur-btn:not(#custom-range-btn)").forEach(btn => {
@@ -725,6 +874,8 @@
 
   updateCharts();
   syncMarkerToggle();
+  setChartTab(activeTab);
+  window.mdmChart = { allBattery, allTemp, allRam, updateCharts };
 })();
 </script>
 
@@ -784,7 +935,7 @@
                   <option value="{{.ApkURL}}">{{.Name}}</option>
                   {{end}}
                 </select>
-                <button type="button" class="btn-outline" onclick="openAppModal()"><span class="ui-icon"><svg viewBox="0 0 24 24"><path d="M12 5v14"/><path d="M5 12h14"/></svg></span>New App</button>
+                <button type="button" class="btn-outline btn-plus" onclick="openAppModal()" title="New App"><span class="ui-icon"><svg viewBox="0 0 24 24"><path d="M12 5v14"/><path d="M5 12h14"/></svg></span></button>
               </div>
             </div>
           {{else}}
@@ -857,54 +1008,16 @@
 </div>
 
 <!-- Kiosk Management -->
-<div class="card" style="margin-bottom:16px;">
-  <div class="card-header">
+<div class="card" style="margin-bottom:16px;position:relative;overflow:hidden;">
+  <div class="card-header" style="opacity:0.5;">
     <h3>Kiosk Mode</h3>
-    {{if .Device.KioskEnabled}}
-      <span class="status-badge ok">Active</span>
-    {{else}}
-      <span class="status-badge muted">Disabled</span>
-    {{end}}
+    <span class="status-badge muted">Coming Soon</span>
   </div>
-  <form action="/devices/{{.Device.SerialNumber}}/kiosk" method="POST" class="command-form">
-    <input type="hidden" name="kiosk_enabled" id="kiosk-enabled-input" value="{{if .KioskConfig.KioskEnabled}}1{{else}}0{{end}}">
-    <div class="kiosk-summary">
-      <div>
-        <div class="kiosk-summary-label">Current State</div>
-        <div class="kiosk-summary-value">{{if .KioskConfig.KioskEnabled}}Pinned to {{.KioskConfig.KioskPackage}}{{else}}Device is free to leave the app{{end}}</div>
-      </div>
-      <div class="seg-control kiosk-mode-control">
-        <button type="button" class="seg-btn {{if .KioskConfig.KioskEnabled}}active{{end}}" data-mode="enable" onclick="setKioskMode('enable')">Enable</button>
-        <button type="button" class="seg-btn {{if not .KioskConfig.KioskEnabled}}active{{end}}" data-mode="disable" onclick="setKioskMode('disable')">Disable</button>
-      </div>
-    </div>
-
-    <div id="kiosk-package-row" style="display:{{if .KioskConfig.KioskEnabled}}block{{else}}none{{end}}">
-      <div class="form-row">
-        <label class="form-label">Pinned App</label>
-        {{if .InstalledPackages}}
-          <select name="kiosk_package" id="kiosk-package-input" class="form-input" style="max-width:520px;" {{if .KioskConfig.KioskEnabled}}required{{end}}>
-            <option value="">— select a package —</option>
-            {{range .InstalledPackages}}
-              <option value="{{.PackageName}}" {{if eq .PackageName $.KioskConfig.KioskPackage}}selected{{end}}>
-                {{if .AppName}}{{.AppName}} — {{end}}{{.PackageName}}{{if .VersionName}} ({{.VersionName}}){{end}}
-              </option>
-            {{end}}
-          </select>
-          <div class="form-hint">Choose the app that should remain pinned on the device.</div>
-        {{else}}
-          <p class="muted small">No installed packages on record. Send a checkin with <code>installed_apps</code> first, or enter the package manually.</p>
-          <input type="text" name="kiosk_package" id="kiosk-package-input" class="form-input" style="max-width:520px;"
-                 value="{{.KioskConfig.KioskPackage}}" placeholder="com.example.app" {{if .KioskConfig.KioskEnabled}}required{{end}}>
-        {{end}}
-      </div>
-    </div>
-
-    <div class="muted small">{{if .KioskConfig.KioskEnabled}}Saving with Disable selected will let the device exit kiosk on next checkin.{{else}}Saving with Enable selected will lock the device into the chosen app on next checkin.{{end}}</div>
-    <div>
-      <button type="submit" class="btn-primary">Save Kiosk Config</button>
-    </div>
-  </form>
+  <div style="padding:32px 24px;display:flex;flex-direction:column;align-items:center;gap:10px;opacity:0.5;pointer-events:none;user-select:none;">
+    <div style="font-size:28px;">&#128274;</div>
+    <div style="font-weight:600;font-size:14px;">Kiosk Mode</div>
+    <div class="muted small" style="text-align:center;max-width:320px;">Kiosk configuration is not available yet. This feature is coming soon.</div>
+  </div>
 </div>
 
 {{template "device-commands" .}}
@@ -940,6 +1053,61 @@
 </div>
 
 <script>
+  (function () {
+    var serial = '{{.Device.SerialNumber}}';
+    if (!serial || !window.EventSource) return;
+    var es = new EventSource('/devices/' + encodeURIComponent(serial) + '/events');
+
+    es.addEventListener('device', function (e) {
+      var d = {};
+      try { d = JSON.parse(e.data); } catch (_) {}
+
+      console.log('[mdm] device event', d, 'mdmChart:', !!window.mdmChart);
+
+      // dispatch for HTMX stats/commands/checkins re-fetch
+      document.body.dispatchEvent(new CustomEvent('device-updated'));
+
+      // push new point into charts
+      if (d.ts_ms && window.mdmChart) {
+        var wlc = d.wlc !== undefined && d.wlc !== null ? d.wlc : undefined;
+        window.mdmChart.allBattery.push({x: d.ts_ms, y: d.battery_pct, wlc: wlc});
+        if (d.temp_c !== null && d.temp_c !== undefined)
+          window.mdmChart.allTemp.push({x: d.ts_ms, y: d.temp_c});
+        if (d.ram_pct !== null && d.ram_pct !== undefined)
+          window.mdmChart.allRam.push({x: d.ts_ms, y: d.ram_pct});
+        console.log('[mdm] pushing to chart, allBattery length:', window.mdmChart.allBattery.length);
+        window.mdmChart.updateCharts();
+      }
+
+    });
+
+    es.addEventListener('presence', function (event) {
+      var badge = document.getElementById('ws-badge');
+      if (!badge) return;
+      var online = event.data === 'online';
+      badge.className = 'ws-badge ' + (online ? 'online' : 'offline');
+      badge.innerHTML = '<span class="ws-dot"></span>' + (online ? 'online' : 'offline');
+      badge.setAttribute('title', online ? 'WebSocket connected' : 'No WebSocket connection');
+    });
+    window.addEventListener('beforeunload', function () { es.close(); });
+  })();
+
+function toggleSection(header) {
+  var body = header.nextElementSibling;
+  var arrow = header.querySelector('.collapse-arrow');
+  if (body.style.display === 'none') {
+    body.style.display = '';
+    arrow.textContent = '▼';
+    var card = header.closest('.card');
+    if (card && window.htmx && card.hasAttribute('hx-trigger')) {
+      window.htmx.trigger(card, 'load');
+    }
+  } else {
+    body.style.display = 'none';
+    arrow.textContent = '▶';
+  }
+}
+
 function setKioskMode(mode) {
   var enable = mode === 'enable';
   document.getElementById('kiosk-enabled-input').value = enable ? '1' : '0';

@@ -1,0 +1,9 @@
+client-app/
+__pycache__/
+*.patch
+*.log
+static/vendor/
+docker/
+server
+client-app
+.claudeignore

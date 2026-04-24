@@ -9,8 +9,8 @@
           onsubmit="return confirmBulkHide(event)">
       <button type="submit" class="btn-danger-sm">Hide Selected</button>
     </form>
-    <button type="button" class="btn-outline" onclick="openBulkKioskModal()" style="padding:3px 10px;font-size:12px;">Kiosk</button>
-    <button type="button" class="btn-outline" onclick="openBulkGroupModal()" style="padding:3px 10px;font-size:12px;">Create Group</button>
+    <button type="button" class="btn-outline" disabled title="Coming soon" style="padding:3px 10px;font-size:12px;opacity:0.45;cursor:not-allowed;">Kiosk</button>
+    <button type="button" class="btn-outline" onclick="openBulkGroupModal()" style="padding:3px 10px;font-size:12px;"><span class="ui-icon" style="width:12px;height:12px;margin-right:4px;"><svg viewBox="0 0 24 24"><path d="M12 5v14"/><path d="M5 12h14"/></svg></span>Create Group</button>
     <button type="button" class="btn-outline" onclick="bulkSendCommand()" style="padding:3px 10px;font-size:12px;">Send Command</button>
     <button type="button" class="btn-danger-sm" onclick="bulkReboot()" title="Reboot selected devices">Reboot</button>
     <button type="button" class="btn-outline" onclick="bulkExport()" style="padding:3px 10px;font-size:12px;">Export</button>
@@ -55,9 +55,8 @@
   </thead>
   <tbody>
     {{if .Devices}}
-      {{$now := nowUTC}}
       {{range .Devices}}
-      <tr class="{{rowClasses . $now}}">
+      <tr class="{{rowClasses .}}" data-serial="{{.SerialNumber}}">
         <td><input type="checkbox" class="device-cb" value="{{.SerialNumber}}" onchange="updateBulkBar()"></td>
         <td class="mono" style="white-space:nowrap;">
           <span class="ws-dot {{if index $.Online .ID}}online{{end}}" title="{{if index $.Online .ID}}WebSocket connected{{else}}offline{{end}}"></span>{{.SerialNumber}}
@@ -189,7 +188,12 @@ document.querySelectorAll('.page-nav').forEach(function(btn) {
     <h2 class="page-title icon-title"><span class="ui-icon"><svg viewBox="0 0 24 24"><rect x="3" y="5" width="7" height="6" rx="1"/><rect x="14" y="5" width="7" height="6" rx="1"/><rect x="3" y="14" width="7" height="6" rx="1"/><rect x="14" y="14" width="7" height="6" rx="1"/></svg></span>Devices</h2>
     <p class="page-subtitle">{{.Total}} device{{if ne .Total 1}}s{{end}} registered</p>
   </div>
-  <span class="refresh-badge" id="refresh-indicator">Auto-refresh every 60s</span>
+  <div style="display:flex;align-items:center;gap:10px;">
+    <span class="refresh-badge" id="refresh-indicator" style="display:none;">Refreshing…</span>
+    <button type="button" class="btn-outline" onclick="window.mdmRefreshDevices && window.mdmRefreshDevices()" title="Refresh device list">
+      <span class="ui-icon"><svg viewBox="0 0 24 24"><path d="M4 12a8 8 0 0 1 14-5"/><path d="M4 4v6h6"/><path d="M20 12a8 8 0 0 1-14 5"/><path d="M20 20v-6h-6"/></svg></span>Refresh
+    </button>
+  </div>
 </div>
 
 {{with .Summary}}
@@ -202,7 +206,7 @@ document.querySelectorAll('.page-nav').forEach(function(btn) {
   <div class="summary-card">
     <span class="summary-icon"><svg viewBox="0 0 24 24"><path d="M12 6v6l4 2"/><circle cx="12" cy="12" r="8"/></svg></span>
     <div class="summary-value ok">{{.RecentlyActive}}</div>
-    <div class="summary-label">Active (last 3 min)</div>
+    <div class="summary-label">Active (last {{$.ActiveThresholdLabel}})</div>
   </div>
   <div class="summary-card">
     <span class="summary-icon"><svg viewBox="0 0 24 24"><rect x="3" y="8" width="16" height="8" rx="2"/><path d="M21 10v4"/><path d="M7 12h4"/></svg></span>
@@ -556,13 +560,103 @@ document.addEventListener('keydown', function(e) {
 <div class="card"
      id="device-table-container"
      hx-get="/"
-     hx-trigger="every 60s"
+     hx-trigger="refresh-devices from:body"
      hx-target="#device-table-container"
      hx-swap="innerHTML"
      hx-indicator="#refresh-indicator"
      hx-vals='js:getFilterVals()'>
   {{template "device-table" .}}
 </div>
+
+<script>
+  // Manual refresh (used by refresh button and visibility change).
+  (function () {
+    var lastRefresh = Date.now();
+    window.mdmRefreshDevices = function () {
+      lastRefresh = Date.now();
+      document.body.dispatchEvent(new CustomEvent('refresh-devices'));
+    };
+    document.addEventListener('visibilitychange', function () {
+      if (document.hidden) return;
+      if (Date.now() - lastRefresh > 120000) window.mdmRefreshDevices();
+    });
+  })();
+
+  // Real-time row patching via SSE.
+  (function () {
+    if (!window.EventSource) return;
+
+    function patchRow(d) {
+      var tr = document.querySelector('tr[data-serial="' + d.serial + '"]');
+      if (!tr) return;
+
+      var cells = tr.cells;
+
+      // col 1: ws-dot + serial (dot class only)
+      var dot = cells[1].querySelector('.ws-dot');
+      if (dot) {
+        dot.className = 'ws-dot' + (d.online ? ' online' : '');
+        dot.title = d.online ? 'WebSocket connected' : 'offline';
+      }
+
+      // col 2: build_id
+      cells[2].textContent = d.build_id;
+
+      // col 3: battery
+      var bar = cells[3].querySelector('.battery-bar');
+      if (bar) {
+        bar.className = 'battery-bar ' + d.battery_class;
+        bar.style.width = d.battery_width;
+      }
+      var label = cells[3].querySelector('.battery-label');
+      if (label) label.textContent = d.battery_pct + '%';
+
+      // col 4: ram
+      if (d.has_ram) {
+        var cls = d.ram_pct >= 80 ? 'danger' : d.ram_pct >= 60 ? 'warn' : 'ok';
+        cells[4].innerHTML = '<span class="' + cls + '">' + d.ram_pct + '%</span>';
+      } else {
+        cells[4].innerHTML = '<span class="muted small">—</span>';
+      }
+
+      // col 5: temp
+      if (d.temp_str) {
+        cells[5].innerHTML = '<span class="' + d.temp_class + '">' + d.temp_str + '</span>';
+      } else {
+        cells[5].innerHTML = '<span class="muted small">—</span>';
+      }
+
+      // col 6: last seen
+      var seenHtml = d.time_since;
+      if (d.poll_interval_ms > 0 && d.last_seen_iso) {
+        var fallback = d.last_seen_iso.replace('T', ' ').replace('Z', ' UTC').slice(0, 19) + ' UTC';
+        seenHtml += ' <span class="last-synced">synced <span class="js-local-time" data-utc="' + d.last_seen_iso + '" data-format="short">' + fallback + '</span></span>';
+      }
+      cells[6].className = 'muted';
+      cells[6].innerHTML = seenHtml;
+      if (window.localizeTimes) window.localizeTimes(cells[6]);
+
+      // col 8: kiosk
+      if (d.kiosk_enabled) {
+        cells[8].innerHTML = '<span class="status-badge ok" title="' + d.kiosk_package + '">Kiosk</span>';
+      } else {
+        cells[8].innerHTML = '<span class="muted small">—</span>';
+      }
+
+      // row-level alert classes
+      tr.className = d.row_classes;
+      tr.setAttribute('data-serial', d.serial);
+    }
+
+    var es = new EventSource('/events/devices');
+    es.addEventListener('device-update', function (e) {
+      try { patchRow(JSON.parse(e.data)); } catch (_) {}
+    });
+    es.onerror = function () {
+      // browser will auto-reconnect; no action needed
+    };
+  })();
+</script>
 
 <div id="confirm-modal" class="modal-backdrop" onclick="closeConfirmModal(event)">
   <div class="modal-box">

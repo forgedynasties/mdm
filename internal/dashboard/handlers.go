@@ -1,9 +1,12 @@
 package dashboard
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha1"
 	"crypto/subtle"
 	"encoding/csv"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"html"
@@ -21,6 +24,27 @@ import (
 	"mdm/internal/shell"
 	"mdm/internal/ws"
 )
+
+// renderCachedHTML renders a template into a buffer, computes its ETag, and
+// writes 304 when the client already has the same version. Used by polling
+// partials to short-circuit unchanged responses.
+func (h *Handler) renderCachedHTML(w http.ResponseWriter, r *http.Request, name string, data any) {
+	var buf bytes.Buffer
+	if err := h.tmpl.ExecuteTemplate(&buf, name, data); err != nil {
+		http.Error(w, "render error", http.StatusInternalServerError)
+		return
+	}
+	sum := sha1.Sum(buf.Bytes())
+	etag := `"` + hex.EncodeToString(sum[:]) + `"`
+	w.Header().Set("ETag", etag)
+	w.Header().Set("Cache-Control", "private, no-cache")
+	if match := r.Header.Get("If-None-Match"); match != "" && match == etag {
+		w.WriteHeader(http.StatusNotModified)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Write(buf.Bytes())
+}
 
 type Handler struct {
 	db       *db.DB
@@ -54,22 +78,9 @@ func extractBatteryTempC(raw json.RawMessage) (float64, bool) {
 	return temp, true
 }
 
-func deviceRowClasses(dev db.Device, now time.Time) string {
+func deviceRowClasses(dev db.Device) string {
 	var classes []string
 
-	staleAfter := 3 * time.Minute
-	if dev.PollIntervalMs > 0 {
-		poll := time.Duration(dev.PollIntervalMs) * time.Millisecond
-		if poll > 0 {
-			staleAfter = poll * 2
-			if staleAfter < 3*time.Minute {
-				staleAfter = 3 * time.Minute
-			}
-		}
-	}
-	if !dev.LastSeenAt.IsZero() && now.Sub(dev.LastSeenAt) > staleAfter {
-		classes = append(classes, "row-stale")
-	}
 	if dev.BatteryPct < 20 {
 		classes = append(classes, "row-alert-battery")
 	}
@@ -78,6 +89,98 @@ func deviceRowClasses(dev db.Device, now time.Time) string {
 	}
 
 	return strings.Join(classes, " ")
+}
+
+// DeviceRowJSON holds the pre-computed, JSON-serialisable data for one fleet table row.
+type DeviceRowJSON struct {
+	Serial       string `json:"serial"`
+	BuildID      string `json:"build_id"`
+	Online       bool   `json:"online"`
+	BatteryPct   int    `json:"battery_pct"`
+	BatteryClass string `json:"battery_class"`
+	BatteryWidth string `json:"battery_width"`
+	RamPct       int    `json:"ram_pct"`     // 0 = no data
+	HasRam       bool   `json:"has_ram"`
+	TempStr      string `json:"temp_str"`    // "" = no data
+	TempClass    string `json:"temp_class"`
+	LastSeenISO  string `json:"last_seen_iso"` // RFC3339, empty if zero
+	TimeSince    string `json:"time_since"`
+	PollInterval int    `json:"poll_interval_ms"`
+	KioskEnabled bool   `json:"kiosk_enabled"`
+	KioskPackage string `json:"kiosk_package"`
+	RowClasses   string `json:"row_classes"`
+}
+
+func deviceToRowJSON(dev db.Device, online bool) DeviceRowJSON {
+	r := DeviceRowJSON{
+		Serial:       dev.SerialNumber,
+		BuildID:      dev.BuildID,
+		Online:       online,
+		BatteryPct:   dev.BatteryPct,
+		BatteryWidth: fmt.Sprintf("%d%%", dev.BatteryPct),
+		PollInterval: dev.PollIntervalMs,
+		KioskEnabled: dev.KioskEnabled,
+		KioskPackage: dev.KioskPackage,
+		RowClasses:   deviceRowClasses(dev),
+	}
+
+	switch {
+	case dev.BatteryPct < 20:
+		r.BatteryClass = "battery-low"
+	case dev.BatteryPct < 50:
+		r.BatteryClass = "battery-mid"
+	default:
+		r.BatteryClass = "battery-ok"
+	}
+
+	if len(dev.LatestExtra) > 0 {
+		var extra map[string]json.RawMessage
+		if json.Unmarshal(dev.LatestExtra, &extra) == nil {
+			if v, ok := extra["ram_usage_mb"]; ok {
+				var ram map[string]int
+				if json.Unmarshal(v, &ram) == nil {
+					total := ram["total"]
+					if total > 0 {
+						r.HasRam = true
+						r.RamPct = ram["used"] * 100 / total
+					}
+				}
+			}
+		}
+	}
+
+	if temp, ok := extractBatteryTempC(dev.LatestExtra); ok {
+		r.TempStr = fmt.Sprintf("%.1f°C", temp)
+		switch {
+		case temp >= 60:
+			r.TempClass = "danger"
+		case temp >= 45:
+			r.TempClass = "warn"
+		case temp <= -10:
+			r.TempClass = "danger"
+		case temp <= 0:
+			r.TempClass = "warn"
+		default:
+			r.TempClass = "ok"
+		}
+	}
+
+	if !dev.LastSeenAt.IsZero() {
+		r.LastSeenISO = dev.LastSeenAt.UTC().Format(time.RFC3339)
+		d := time.Since(dev.LastSeenAt)
+		switch {
+		case d < time.Minute:
+			r.TimeSince = "just now"
+		case d < time.Hour:
+			r.TimeSince = fmt.Sprintf("%dm ago", int(d.Minutes()))
+		case d < 24*time.Hour:
+			r.TimeSince = fmt.Sprintf("%dh ago", int(d.Hours()))
+		default:
+			r.TimeSince = fmt.Sprintf("%dd ago", int(d.Hours()/24))
+		}
+	}
+
+	return r
 }
 
 func colorizeLogcatText(content string) template.HTML {
@@ -335,8 +438,8 @@ func NewHandler(d *db.DB, hub *ws.Hub, shellMgr *shell.Manager, sessionSecret, u
 			}
 			return template.JS(fmt.Sprintf("%.1f", temp))
 		},
-		"rowClasses": func(dev db.Device, now time.Time) string {
-			return deviceRowClasses(dev, now)
+		"rowClasses": func(dev db.Device) string {
+			return deviceRowClasses(dev)
 		},
 		"colorizeLogcat": func(content string) template.HTML {
 			return colorizeLogcatText(content)
@@ -400,6 +503,25 @@ func NewHandler(d *db.DB, hub *ws.Hub, shellMgr *shell.Manager, sessionSecret, u
 				return s
 			}
 			return string(v)
+		},
+		"deployStatusClass": func(s string) string {
+			switch s {
+			case "complete", "installed":
+				return "ok"
+			case "active":
+				return "warn"
+			case "failed":
+				return "danger"
+			default:
+				return "muted"
+			}
+		},
+		"truncate": func(s string, n int) string {
+			runes := []rune(s)
+			if len(runes) <= n {
+				return s
+			}
+			return string(runes[:n]) + "…"
 		},
 		"add":    func(a, b int) int { return a + b },
 		"sub":    func(a, b int) int { return a - b },
@@ -502,13 +624,16 @@ func (h *Handler) DeviceList(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	activeThreshold := h.cfg.CheckinInterval() * 3
+	activeThresholdLabel := fmt.Sprintf("%d min", activeThreshold/60)
 	filter := db.DeviceFilter{
-		Search:  q,
-		GroupID: groupID,
-		Online:  r.URL.Query().Get("status"),
-		BuildID: r.URL.Query().Get("build"),
-		Battery: r.URL.Query().Get("battery"),
-		Hidden:  r.URL.Query().Get("hidden"),
+		Search:              q,
+		GroupID:             groupID,
+		Online:              r.URL.Query().Get("status"),
+		BuildID:             r.URL.Query().Get("build"),
+		Battery:             r.URL.Query().Get("battery"),
+		Hidden:              r.URL.Query().Get("hidden"),
+		ActiveThresholdSecs: activeThreshold,
 	}
 
 	devices, err := h.db.ListDevices(r.Context(), filter, offset, pageSize, sort, dir)
@@ -521,7 +646,7 @@ func (h *Handler) DeviceList(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Internal error", http.StatusInternalServerError)
 		return
 	}
-	summary, err := h.db.GetSummary(r.Context())
+	summary, err := h.db.GetSummary(r.Context(), activeThreshold)
 	if err != nil {
 		http.Error(w, "Internal error", http.StatusInternalServerError)
 		return
@@ -543,24 +668,26 @@ func (h *Handler) DeviceList(w http.ResponseWriter, r *http.Request) {
 	}
 
 	data := map[string]any{
-		"Title":         "Devices",
-		"Devices":       devices,
-		"Total":         total,
-		"Page":          page,
-		"TotalPages":    totalPages,
-		"Query":         q,
-		"PageSize":      pageSize,
-		"Summary":       summary,
-		"Sort":          sort,
-		"SortDir":       dir,
-		"Online":        online,
-		"Groups":        groups,
-		"Builds":        builds,
-		"FilterGroup":   r.URL.Query().Get("group"),
-		"FilterStatus":  r.URL.Query().Get("status"),
-		"FilterBuild":   r.URL.Query().Get("build"),
-		"FilterBattery": r.URL.Query().Get("battery"),
-		"FilterHidden":  r.URL.Query().Get("hidden"),
+		"Title":               "Devices",
+		"Devices":             devices,
+		"Total":               total,
+		"Page":                page,
+		"TotalPages":          totalPages,
+		"Query":               q,
+		"PageSize":            pageSize,
+		"Summary":             summary,
+		"Sort":                sort,
+		"SortDir":             dir,
+		"Online":              online,
+		"Groups":              groups,
+		"Builds":              builds,
+		"FilterGroup":         r.URL.Query().Get("group"),
+		"FilterStatus":        r.URL.Query().Get("status"),
+		"FilterBuild":         r.URL.Query().Get("build"),
+		"FilterBattery":       r.URL.Query().Get("battery"),
+		"FilterHidden":        r.URL.Query().Get("hidden"),
+		"ActiveThresholdSecs":  activeThreshold,
+		"ActiveThresholdLabel": activeThresholdLabel,
 	}
 
 	if r.Header.Get("HX-Request") == "true" {
@@ -654,8 +781,8 @@ func (h *Handler) DeviceDetail(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// DeviceOnlineStatus returns a tiny HTML fragment used by htmx to poll the
-// WebSocket connection state on the device detail page.
+// DeviceOnlineStatus returns a tiny HTML fragment with the current connection state.
+// Kept for initial page render; live updates come from DevicePresenceStream.
 func (h *Handler) DeviceOnlineStatus(w http.ResponseWriter, r *http.Request) {
 	serial := r.PathValue("serial")
 	device, err := h.db.GetDevice(r.Context(), serial)
@@ -666,9 +793,290 @@ func (h *Handler) DeviceOnlineStatus(w http.ResponseWriter, r *http.Request) {
 	online := h.hub.IsConnected(device.ID)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	if online {
-		fmt.Fprint(w, `<span id="ws-badge" class="ws-badge online" hx-get="/devices/`+serial+`/ws-status" hx-trigger="every 5s" hx-swap="outerHTML" title="WebSocket connected"><span class="ws-dot"></span>online</span>`)
+		fmt.Fprint(w, `<span id="ws-badge" class="ws-badge online" title="WebSocket connected"><span class="ws-dot"></span>online</span>`)
 	} else {
-		fmt.Fprint(w, `<span id="ws-badge" class="ws-badge offline" hx-get="/devices/`+serial+`/ws-status" hx-trigger="every 5s" hx-swap="outerHTML" title="No WebSocket connection"><span class="ws-dot"></span>offline</span>`)
+		fmt.Fprint(w, `<span id="ws-badge" class="ws-badge offline" title="No WebSocket connection"><span class="ws-dot"></span>offline</span>`)
+	}
+}
+
+// DevicePresenceStream streams SSE events for a single device's connection state.
+// Emits an initial snapshot, then pushes "online"/"offline" on change.
+func (h *Handler) DevicePresenceStream(w http.ResponseWriter, r *http.Request) {
+	serial := r.PathValue("serial")
+	device, err := h.db.GetDevice(r.Context(), serial)
+	if err != nil {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
+
+	writeEvent := func(online bool) {
+		state := "offline"
+		if online {
+			state = "online"
+		}
+		fmt.Fprintf(w, "event: presence\ndata: %s\n\n", state)
+		flusher.Flush()
+	}
+
+	writeEvent(h.hub.IsConnected(device.ID))
+
+	sub := h.hub.SubscribePresence()
+	defer h.hub.UnsubscribePresence(sub)
+
+	heartbeat := time.NewTicker(25 * time.Second)
+	defer heartbeat.Stop()
+
+	ctx := r.Context()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case ev, ok := <-sub:
+			if !ok {
+				return
+			}
+			if ev.DeviceID != device.ID {
+				continue
+			}
+			writeEvent(ev.Online)
+		case <-heartbeat.C:
+			fmt.Fprint(w, ": ping\n\n")
+			flusher.Flush()
+		}
+	}
+}
+
+// FleetEvents streams per-device SSE updates for the fleet dashboard.
+// Each event carries a JSON payload so the browser can patch only the affected row.
+func (h *Handler) FleetEvents(w http.ResponseWriter, r *http.Request) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
+
+	fmt.Fprint(w, ": connected\n\n")
+	flusher.Flush()
+
+	sendRow := func(deviceID uuid.UUID) {
+		dev, err := h.db.GetDeviceByID(r.Context(), deviceID)
+		if err != nil {
+			return
+		}
+		row := deviceToRowJSON(*dev, h.hub.IsConnected(deviceID))
+		b, err := json.Marshal(row)
+		if err != nil {
+			return
+		}
+		fmt.Fprintf(w, "event: device-update\ndata: %s\n\n", b)
+		flusher.Flush()
+	}
+
+	presenceSub := h.hub.SubscribePresence()
+	defer h.hub.UnsubscribePresence(presenceSub)
+	updateSub := h.hub.SubscribeDeviceUpdates()
+	defer h.hub.UnsubscribeDeviceUpdates(updateSub)
+
+	heartbeat := time.NewTicker(25 * time.Second)
+	defer heartbeat.Stop()
+
+	ctx := r.Context()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-heartbeat.C:
+			fmt.Fprint(w, ": keep-alive\n\n")
+			flusher.Flush()
+		case ev, ok := <-presenceSub:
+			if !ok {
+				return
+			}
+			sendRow(ev.DeviceID)
+		case ev, ok := <-updateSub:
+			if !ok {
+				return
+			}
+			sendRow(ev.DeviceID)
+		}
+	}
+}
+
+type deviceEventPayload struct {
+	TsMs       int64    `json:"ts_ms"`
+	BatteryPct int      `json:"battery_pct"`
+	Wlc        *int     `json:"wlc"`    // nil = no data
+	TempC      *float64 `json:"temp_c"` // nil = no data
+	RamPct     *float64 `json:"ram_pct"` // nil = no data
+}
+
+func buildDeviceEventPayload(c *db.Checkin) deviceEventPayload {
+	p := deviceEventPayload{
+		TsMs:       c.CreatedAt.UnixMilli(),
+		BatteryPct: c.BatteryPct,
+	}
+	if len(c.Extra) > 0 {
+		var extra map[string]json.RawMessage
+		if json.Unmarshal(c.Extra, &extra) == nil {
+			if v, ok := extra["wlc_status"]; ok {
+				var n int
+				if json.Unmarshal(v, &n) == nil {
+					p.Wlc = &n
+				}
+			}
+			if v, ok := extra["ram_usage_mb"]; ok {
+				var ram map[string]int
+				if json.Unmarshal(v, &ram) == nil && ram["total"] > 0 {
+					pct := float64(ram["used"]) * 100 / float64(ram["total"])
+					p.RamPct = &pct
+				}
+			}
+		}
+	}
+	if temp, ok := extractBatteryTempC(c.Extra); ok {
+		p.TempC = &temp
+	}
+	return p
+}
+
+// CommandEvents streams SSE notifications for a command detail page.
+func (h *Handler) CommandEvents(w http.ResponseWriter, r *http.Request) {
+	cmdID, err := uuid.Parse(r.PathValue("id"))
+	if err != nil {
+		http.Error(w, "invalid command id", http.StatusBadRequest)
+		return
+	}
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
+
+	fmt.Fprint(w, ": connected\n\n")
+	flusher.Flush()
+
+	sub := h.hub.SubscribeCommandUpdates()
+	defer h.hub.UnsubscribeCommandUpdates(sub)
+
+	heartbeat := time.NewTicker(25 * time.Second)
+	defer heartbeat.Stop()
+
+	ctx := r.Context()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-heartbeat.C:
+			fmt.Fprint(w, ": keep-alive\n\n")
+			flusher.Flush()
+		case ev, ok := <-sub:
+			if !ok {
+				return
+			}
+			if ev.CommandID == cmdID {
+				fmt.Fprint(w, "event: command-update\ndata: refresh\n\n")
+				flusher.Flush()
+			}
+		}
+	}
+}
+
+// DeviceEvents streams SSE notifications for a single device detail page.
+func (h *Handler) DeviceEvents(w http.ResponseWriter, r *http.Request) {
+	serial := r.PathValue("serial")
+	device, err := h.db.GetDevice(r.Context(), serial)
+	if err != nil {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
+
+	writePresence := func(online bool) {
+		state := "offline"
+		if online {
+			state = "online"
+		}
+		fmt.Fprintf(w, "event: presence\ndata: %s\n\n", state)
+		flusher.Flush()
+	}
+	writeDeviceUpdate := func() {
+		c, err := h.db.GetLatestCheckin(r.Context(), device.ID)
+		if err != nil {
+			fmt.Fprint(w, "event: device\ndata: {}\n\n")
+			flusher.Flush()
+			return
+		}
+		b, _ := json.Marshal(buildDeviceEventPayload(c))
+		fmt.Fprintf(w, "event: device\ndata: %s\n\n", b)
+		flusher.Flush()
+	}
+
+	writePresence(h.hub.IsConnected(device.ID))
+	writeDeviceUpdate()
+
+	presenceSub := h.hub.SubscribePresence()
+	defer h.hub.UnsubscribePresence(presenceSub)
+	updateSub := h.hub.SubscribeDeviceUpdates()
+	defer h.hub.UnsubscribeDeviceUpdates(updateSub)
+
+	heartbeat := time.NewTicker(25 * time.Second)
+	defer heartbeat.Stop()
+
+	ctx := r.Context()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-heartbeat.C:
+			fmt.Fprint(w, ": keep-alive\n\n")
+			flusher.Flush()
+		case ev, ok := <-presenceSub:
+			if !ok {
+				return
+			}
+			if ev.DeviceID == device.ID {
+				writePresence(ev.Online)
+			}
+		case ev, ok := <-updateSub:
+			if !ok {
+				return
+			}
+			if ev.DeviceID == device.ID {
+				writeDeviceUpdate()
+			}
+		}
 	}
 }
 
@@ -956,7 +1364,7 @@ func (h *Handler) DeviceStatsPartial(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Device not found", http.StatusNotFound)
 		return
 	}
-	h.tmpl.ExecuteTemplate(w, "device-stats", map[string]any{
+	h.renderCachedHTML(w, r, "device-stats", map[string]any{
 		"Device": device,
 	})
 }
@@ -973,7 +1381,7 @@ func (h *Handler) DeviceCommandsPartial(w http.ResponseWriter, r *http.Request) 
 		http.Error(w, "Internal error", http.StatusInternalServerError)
 		return
 	}
-	h.tmpl.ExecuteTemplate(w, "device-commands", map[string]any{
+	h.renderCachedHTML(w, r, "device-commands", map[string]any{
 		"Device":   device,
 		"Commands": commands,
 	})
@@ -1016,7 +1424,7 @@ func (h *Handler) DeviceCheckinsPartial(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	h.tmpl.ExecuteTemplate(w, "device-checkins", map[string]any{
+	h.renderCachedHTML(w, r, "device-checkins", map[string]any{
 		"Device":       device,
 		"Checkins":     checkins,
 		"ExtraColumns": h.cfg.Columns(),
@@ -1247,129 +1655,21 @@ func (h *Handler) BulkKioskUpdate(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/", http.StatusSeeOther)
 }
 
-// ── OTA Updates ───────────────────────────────────────────────────────────────
+// ── OTA Packages & Deployments ────────────────────────────────────────────────
 
-func (h *Handler) Updates(w http.ResponseWriter, r *http.Request) {
-	updates, err := h.db.ListUpdates(r.Context())
+func (h *Handler) OTAPackages(w http.ResponseWriter, r *http.Request) {
+	pkgs, err := h.db.ListOTAPackages(r.Context())
 	if err != nil {
 		http.Error(w, "Internal error", http.StatusInternalServerError)
 		return
 	}
-	for i := range updates {
-		targets, err := h.db.GetUpdateTargets(r.Context(), updates[i].ID)
-		if err == nil {
-			updates[i].Targets = targets
-		}
-	}
-	devices, _ := h.db.ListDevices(r.Context(), db.DeviceFilter{}, 0, 10000, "", "")
-	groups, _ := h.db.ListGroups(r.Context())
 	h.tmpl.ExecuteTemplate(w, "updates.html", map[string]any{
-		"Title":   "Updates",
-		"Updates": updates,
-		"Devices": devices,
-		"Groups":  groups,
+		"Title":    "OTA Packages",
+		"Packages": pkgs,
 	})
 }
 
-func (h *Handler) UpdateDetail(w http.ResponseWriter, r *http.Request) {
-	id, err := strconv.Atoi(r.PathValue("id"))
-	if err != nil {
-		http.Error(w, "Invalid ID", http.StatusBadRequest)
-		return
-	}
-	upd, err := h.db.GetUpdate(r.Context(), id)
-	if err != nil {
-		http.Error(w, "Update not found", http.StatusNotFound)
-		return
-	}
-	targets, _ := h.db.GetUpdateTargets(r.Context(), id)
-	upd.Targets = targets
-
-	// Load devices and groups for the send form
-	devices, _ := h.db.ListDevices(r.Context(), db.DeviceFilter{}, 0, 10000, "", "")
-	groups, _ := h.db.ListGroups(r.Context())
-
-	h.tmpl.ExecuteTemplate(w, "update_detail.html", map[string]any{
-		"Title":   fmt.Sprintf("Update #%d", id),
-		"Update":  upd,
-		"Devices": devices,
-		"Groups":  groups,
-	})
-}
-
-func (h *Handler) UpdateSend(w http.ResponseWriter, r *http.Request) {
-	id, err := strconv.Atoi(r.PathValue("id"))
-	if err != nil {
-		http.Error(w, "Invalid ID", http.StatusBadRequest)
-		return
-	}
-	r.ParseForm()
-
-	var deviceIDs []uuid.UUID
-
-	// Collect device IDs from serial numbers
-	serials := r.Form["serials"]
-	if len(serials) > 0 {
-		ids, err := h.db.GetDeviceIDsBySerials(r.Context(), serials)
-		if err != nil {
-			http.Error(w, "Internal error", http.StatusInternalServerError)
-			return
-		}
-		deviceIDs = append(deviceIDs, ids...)
-	}
-
-	// Collect device IDs from groups
-	groupIDStrs := r.Form["group_ids"]
-	if len(groupIDStrs) > 0 {
-		var groupIDs []uuid.UUID
-		for _, s := range groupIDStrs {
-			if gid, err := uuid.Parse(s); err == nil {
-				groupIDs = append(groupIDs, gid)
-			}
-		}
-		if len(groupIDs) > 0 {
-			ids, err := h.db.GetDeviceIDsByGroupIDs(r.Context(), groupIDs)
-			if err != nil {
-				http.Error(w, "Internal error", http.StatusInternalServerError)
-				return
-			}
-			deviceIDs = append(deviceIDs, ids...)
-		}
-	}
-
-	// Deduplicate
-	seen := make(map[uuid.UUID]bool)
-	var unique []uuid.UUID
-	for _, did := range deviceIDs {
-		if !seen[did] {
-			seen[did] = true
-			unique = append(unique, did)
-		}
-	}
-
-	// Filter out devices with active updates
-	var eligible []uuid.UUID
-	for _, did := range unique {
-		has, err := h.db.DeviceHasActiveUpdate(r.Context(), did)
-		if err != nil || !has {
-			eligible = append(eligible, did)
-		}
-	}
-	if limit, err := strconv.Atoi(strings.TrimSpace(r.FormValue("limit"))); err == nil && limit > 0 && len(eligible) > limit {
-		eligible = eligible[:limit]
-	}
-
-	if len(eligible) > 0 {
-		if err := h.db.SendUpdateToDevices(r.Context(), id, eligible); err != nil {
-			http.Error(w, "Internal error", http.StatusInternalServerError)
-			return
-		}
-	}
-
-	http.Redirect(w, r, fmt.Sprintf("/updates/%d", id), http.StatusSeeOther)
-}
-
-func (h *Handler) UpdateCreate(w http.ResponseWriter, r *http.Request) {
+func (h *Handler) OTAPackageCreate(w http.ResponseWriter, r *http.Request) {
 	r.ParseForm()
 
 	typ := r.FormValue("type")
@@ -1379,6 +1679,7 @@ func (h *Handler) UpdateCreate(w http.ResponseWriter, r *http.Request) {
 	targetBuildID := strings.TrimSpace(r.FormValue("target_build_id"))
 	sourceBuildID := strings.TrimSpace(r.FormValue("source_build_id"))
 	updateURL := strings.TrimSpace(r.FormValue("update_url"))
+	changelog := strings.TrimSpace(r.FormValue("changelog"))
 
 	if targetBuildID == "" || updateURL == "" {
 		http.Error(w, "target_build_id and update_url are required", http.StatusBadRequest)
@@ -1389,11 +1690,80 @@ func (h *Handler) UpdateCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	pkg, err := h.db.CreateOTAPackage(r.Context(), typ, targetBuildID, sourceBuildID, updateURL, time.Now().UTC())
+	pkg, err := h.db.CreateOTAPackage(r.Context(), typ, targetBuildID, sourceBuildID, updateURL, changelog, time.Now().UTC())
 	if err != nil {
 		http.Error(w, "Internal error: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
+	http.Redirect(w, r, fmt.Sprintf("/updates/%d", pkg.ID), http.StatusSeeOther)
+}
+
+func (h *Handler) OTAPackageDetail(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.Atoi(r.PathValue("id"))
+	if err != nil {
+		http.Error(w, "Invalid ID", http.StatusBadRequest)
+		return
+	}
+	pkg, err := h.db.GetOTAPackage(r.Context(), id)
+	if err != nil {
+		http.Error(w, "Package not found", http.StatusNotFound)
+		return
+	}
+	deployments, _ := h.db.ListDeploymentsByPackage(r.Context(), id)
+	devices, _ := h.db.ListDevices(r.Context(), db.DeviceFilter{}, 0, 10000, "", "")
+	groups, _ := h.db.ListGroups(r.Context())
+
+	h.tmpl.ExecuteTemplate(w, "update_detail.html", map[string]any{
+		"Title":       fmt.Sprintf("OTA Package #%d", id),
+		"Package":     pkg,
+		"Deployments": deployments,
+		"Devices":     devices,
+		"Groups":      groups,
+	})
+}
+
+func (h *Handler) OTAPackageYank(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.Atoi(r.PathValue("id"))
+	if err != nil {
+		http.Error(w, "Invalid ID", http.StatusBadRequest)
+		return
+	}
+	pkg, err := h.db.GetOTAPackage(r.Context(), id)
+	if err != nil {
+		http.Error(w, "Package not found", http.StatusNotFound)
+		return
+	}
+	newStatus := "yanked"
+	if pkg.Status == "yanked" {
+		newStatus = "active"
+	}
+	if err := h.db.SetOTAPackageStatus(r.Context(), id, newStatus); err != nil {
+		http.Error(w, "Internal error", http.StatusInternalServerError)
+		return
+	}
+	http.Redirect(w, r, fmt.Sprintf("/updates/%d", id), http.StatusSeeOther)
+}
+
+func (h *Handler) OTAPackageDelete(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.Atoi(r.PathValue("id"))
+	if err != nil {
+		http.Error(w, "Invalid ID", http.StatusBadRequest)
+		return
+	}
+	if err := h.db.DeleteOTAPackage(r.Context(), id); err != nil {
+		http.Error(w, "Internal error", http.StatusInternalServerError)
+		return
+	}
+	http.Redirect(w, r, "/updates", http.StatusSeeOther)
+}
+
+func (h *Handler) OTAPackageDeploy(w http.ResponseWriter, r *http.Request) {
+	pkgID, err := strconv.Atoi(r.PathValue("id"))
+	if err != nil {
+		http.Error(w, "Invalid ID", http.StatusBadRequest)
+		return
+	}
+	r.ParseForm()
 
 	rebootBehavior := r.FormValue("reboot_behavior")
 	if rebootBehavior == "" {
@@ -1409,24 +1779,115 @@ func (h *Handler) UpdateCreate(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	if _, err := h.db.CreateUpdate(r.Context(), pkg.ID, rebootBehavior, scheduledTime); err != nil {
+	deployment, err := h.db.CreateUpdate(r.Context(), pkgID, rebootBehavior, scheduledTime)
+	if err != nil {
 		http.Error(w, "Internal error: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
-	http.Redirect(w, r, "/updates", http.StatusSeeOther)
+
+	eligible, err := h.resolveEligibleDevices(r)
+	if err != nil {
+		http.Error(w, "Internal error", http.StatusInternalServerError)
+		return
+	}
+	if len(eligible) > 0 {
+		if err := h.db.SendUpdateToDevices(r.Context(), deployment.ID, eligible); err != nil {
+			http.Error(w, "Internal error", http.StatusInternalServerError)
+			return
+		}
+	}
+
+	http.Redirect(w, r, fmt.Sprintf("/updates/%d/deployments/%d", pkgID, deployment.ID), http.StatusSeeOther)
 }
 
-func (h *Handler) UpdateDelete(w http.ResponseWriter, r *http.Request) {
-	id, err := strconv.Atoi(r.PathValue("id"))
+func (h *Handler) DeploymentDetail(w http.ResponseWriter, r *http.Request) {
+	pkgID, err := strconv.Atoi(r.PathValue("id"))
 	if err != nil {
 		http.Error(w, "Invalid ID", http.StatusBadRequest)
 		return
 	}
-	if err := h.db.DeleteUpdate(r.Context(), id); err != nil {
+	did, err := strconv.Atoi(r.PathValue("did"))
+	if err != nil {
+		http.Error(w, "Invalid deployment ID", http.StatusBadRequest)
+		return
+	}
+	upd, err := h.db.GetUpdate(r.Context(), did)
+	if err != nil || upd.OtaPackageID != pkgID {
+		http.Error(w, "Deployment not found", http.StatusNotFound)
+		return
+	}
+	targets, _ := h.db.GetUpdateTargets(r.Context(), did)
+	upd.Targets = targets
+
+	h.tmpl.ExecuteTemplate(w, "deployment_detail.html", map[string]any{
+		"Title":      fmt.Sprintf("Deployment #%d", did),
+		"Deployment": upd,
+		"Package":    upd.OtaPackage,
+	})
+}
+
+func (h *Handler) DeploymentDelete(w http.ResponseWriter, r *http.Request) {
+	pkgID, err := strconv.Atoi(r.PathValue("id"))
+	if err != nil {
+		http.Error(w, "Invalid ID", http.StatusBadRequest)
+		return
+	}
+	did, err := strconv.Atoi(r.PathValue("did"))
+	if err != nil {
+		http.Error(w, "Invalid deployment ID", http.StatusBadRequest)
+		return
+	}
+	if err := h.db.DeleteUpdate(r.Context(), did); err != nil {
 		http.Error(w, "Internal error", http.StatusInternalServerError)
 		return
 	}
-	http.Redirect(w, r, "/updates", http.StatusSeeOther)
+	http.Redirect(w, r, fmt.Sprintf("/updates/%d", pkgID), http.StatusSeeOther)
+}
+
+func (h *Handler) resolveEligibleDevices(r *http.Request) ([]uuid.UUID, error) {
+	var deviceIDs []uuid.UUID
+
+	serials := r.Form["serials"]
+	if len(serials) > 0 {
+		ids, err := h.db.GetDeviceIDsBySerials(r.Context(), serials)
+		if err != nil {
+			return nil, err
+		}
+		deviceIDs = append(deviceIDs, ids...)
+	}
+
+	for _, s := range r.Form["group_ids"] {
+		if gid, err := uuid.Parse(s); err == nil {
+			ids, err := h.db.GetDeviceIDsByGroupIDs(r.Context(), []uuid.UUID{gid})
+			if err != nil {
+				return nil, err
+			}
+			deviceIDs = append(deviceIDs, ids...)
+		}
+	}
+
+	seen := make(map[uuid.UUID]bool)
+	var unique []uuid.UUID
+	for _, did := range deviceIDs {
+		if !seen[did] {
+			seen[did] = true
+			unique = append(unique, did)
+		}
+	}
+
+	var eligible []uuid.UUID
+	for _, did := range unique {
+		has, err := h.db.DeviceHasActiveUpdate(r.Context(), did)
+		if err != nil || !has {
+			eligible = append(eligible, did)
+		}
+	}
+
+	if limit, err := strconv.Atoi(strings.TrimSpace(r.FormValue("limit"))); err == nil && limit > 0 && len(eligible) > limit {
+		eligible = eligible[:limit]
+	}
+
+	return eligible, nil
 }
 
 // ── Commands ──────────────────────────────────────────────────────────────────
@@ -1471,7 +1932,7 @@ func (h *Handler) CommandStatusPartial(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Internal error", http.StatusInternalServerError)
 		return
 	}
-	h.tmpl.ExecuteTemplate(w, "command-deliveries", map[string]any{
+	h.renderCachedHTML(w, r, "command-deliveries", map[string]any{
 		"Command":    cmd,
 		"Deliveries": deliveries,
 	})
@@ -1488,6 +1949,61 @@ func (h *Handler) CommandDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	http.Redirect(w, r, "/commands", http.StatusFound)
+}
+
+func (h *Handler) CommandResendDevice(w http.ResponseWriter, r *http.Request) {
+	id, err := uuid.Parse(r.PathValue("id"))
+	if err != nil {
+		http.Error(w, "Invalid command ID", http.StatusBadRequest)
+		return
+	}
+	serial := r.PathValue("serial")
+	if serial == "" {
+		http.Error(w, "Serial required", http.StatusBadRequest)
+		return
+	}
+	cmd, err := h.db.GetCommand(r.Context(), id)
+	if err != nil {
+		http.Error(w, "Command not found", http.StatusNotFound)
+		return
+	}
+	deviceIDs, err := h.db.GetDeviceIDsBySerials(r.Context(), []string{serial})
+	if err != nil || len(deviceIDs) == 0 {
+		http.Error(w, "Device not found", http.StatusNotFound)
+		return
+	}
+	newCmd, err := h.db.CreateCommand(r.Context(), cmd.Type, cmd.ApkURL, cmd.Payload, "devices", deviceIDs)
+	if err != nil {
+		http.Error(w, "Internal error", http.StatusInternalServerError)
+		return
+	}
+	h.pushCommand(r.Context(), newCmd, "devices", deviceIDs)
+	http.Redirect(w, r, "/commands/"+newCmd.ID.String(), http.StatusFound)
+}
+
+func (h *Handler) CommandResendAll(w http.ResponseWriter, r *http.Request) {
+	id, err := uuid.Parse(r.PathValue("id"))
+	if err != nil {
+		http.Error(w, "Invalid command ID", http.StatusBadRequest)
+		return
+	}
+	cmd, err := h.db.GetCommand(r.Context(), id)
+	if err != nil {
+		http.Error(w, "Command not found", http.StatusNotFound)
+		return
+	}
+	targetIDs, err := h.db.GetCommandTargetIDs(r.Context(), id)
+	if err != nil {
+		http.Error(w, "Internal error", http.StatusInternalServerError)
+		return
+	}
+	newCmd, err := h.db.CreateCommand(r.Context(), cmd.Type, cmd.ApkURL, cmd.Payload, cmd.TargetType, targetIDs)
+	if err != nil {
+		http.Error(w, "Internal error", http.StatusInternalServerError)
+		return
+	}
+	h.pushCommand(r.Context(), newCmd, cmd.TargetType, targetIDs)
+	http.Redirect(w, r, "/commands/"+newCmd.ID.String(), http.StatusFound)
 }
 
 func (h *Handler) CommandDetail(w http.ResponseWriter, r *http.Request) {
@@ -1535,6 +2051,15 @@ func (h *Handler) CommandCreate(w http.ResponseWriter, r *http.Request) {
 
 	var targetIDs []uuid.UUID
 	switch targetType {
+	case "all":
+		// Snapshot: resolve all current device IDs so future devices are unaffected.
+		ids, err := h.db.GetAllDeviceIDs(r.Context())
+		if err != nil {
+			http.Error(w, "Internal error", http.StatusInternalServerError)
+			return
+		}
+		targetType = "devices"
+		targetIDs = ids
 	case "devices":
 		serials := db.ParseSerials(r.FormValue("target_serials"))
 		ids, err := h.db.GetDeviceIDsBySerials(r.Context(), serials)
@@ -1559,7 +2084,7 @@ func (h *Handler) CommandCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	h.pushCommand(r.Context(), cmd, targetType, targetIDs)
-	http.Redirect(w, r, "/commands", http.StatusFound)
+	http.Redirect(w, r, "/commands/"+cmd.ID.String(), http.StatusFound)
 }
 
 func buildPayload(cmdType string, r *http.Request) json.RawMessage {
@@ -1636,14 +2161,27 @@ func (h *Handler) SetupDeleteApp(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) SettingsPage(w http.ResponseWriter, r *http.Request) {
 	h.tmpl.ExecuteTemplate(w, "settings.html", map[string]any{
-		"Title":          "Settings",
-		"ExtraColumns":   h.cfg.Columns(),
-		"LegacyCheckin":  h.cfg.LegacyCheckin(),
+		"Title":           "Settings",
+		"ExtraColumns":    h.cfg.Columns(),
+		"LegacyCheckin":   h.cfg.LegacyCheckin(),
+		"CheckinInterval": h.cfg.CheckinInterval(),
 	})
 }
 
 func (h *Handler) SettingsToggleLegacyCheckin(w http.ResponseWriter, r *http.Request) {
 	h.cfg.SetLegacyCheckin(!h.cfg.LegacyCheckin())
+	http.Redirect(w, r, "/settings", http.StatusFound)
+}
+
+func (h *Handler) SettingsSetCheckinInterval(w http.ResponseWriter, r *http.Request) {
+	r.ParseForm()
+	sec := 60
+	if v := r.FormValue("interval"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 10 {
+			sec = n
+		}
+	}
+	h.cfg.SetCheckinInterval(sec)
 	http.Redirect(w, r, "/settings", http.StatusFound)
 }
 
@@ -1663,6 +2201,55 @@ func (h *Handler) SettingsRemoveColumn(w http.ResponseWriter, r *http.Request) {
 	key := r.PathValue("key")
 	h.cfg.Remove(key)
 	http.Redirect(w, r, "/settings", http.StatusFound)
+}
+
+// LogcatEvents streams SSE notifications for the logcat page of a device.
+func (h *Handler) LogcatEvents(w http.ResponseWriter, r *http.Request) {
+	serial := r.PathValue("serial")
+	device, err := h.db.GetDevice(r.Context(), serial)
+	if err != nil {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
+
+	fmt.Fprint(w, ": connected\n\n")
+	flusher.Flush()
+
+	sub := h.hub.SubscribeLogcatUpdates()
+	defer h.hub.UnsubscribeLogcatUpdates(sub)
+
+	heartbeat := time.NewTicker(25 * time.Second)
+	defer heartbeat.Stop()
+
+	ctx := r.Context()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-heartbeat.C:
+			fmt.Fprint(w, ": keep-alive\n\n")
+			flusher.Flush()
+		case ev, ok := <-sub:
+			if !ok {
+				return
+			}
+			if ev.DeviceID == device.ID {
+				fmt.Fprint(w, "event: logcat-update\ndata: refresh\n\n")
+				flusher.Flush()
+			}
+		}
+	}
 }
 
 func (h *Handler) LogcatPage(w http.ResponseWriter, r *http.Request) {
@@ -1874,8 +2461,11 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /logout", h.Logout)
 
 	mux.HandleFunc("GET /{$}", h.requireAuth(h.DeviceList))
+	mux.HandleFunc("GET /events/devices", h.requireAuth(h.FleetEvents))
 	mux.HandleFunc("GET /devices/{serial}", h.requireAuth(h.DeviceDetail))
+	mux.HandleFunc("GET /devices/{serial}/events", h.requireAuth(h.DeviceEvents))
 	mux.HandleFunc("GET /devices/{serial}/ws-status", h.requireAuth(h.DeviceOnlineStatus))
+	mux.HandleFunc("GET /devices/{serial}/presence-stream", h.requireAuth(h.DevicePresenceStream))
 	mux.HandleFunc("GET /devices/{serial}/stats", h.requireAuth(h.DeviceStatsPartial))
 	mux.HandleFunc("GET /devices/{serial}/battery.csv", h.requireAuth(h.DeviceBatteryCSV))
 	mux.HandleFunc("GET /devices/{serial}/commands-status", h.requireAuth(h.DeviceCommandsPartial))
@@ -1891,6 +2481,7 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /devices/{serial}/packages", h.requireAuth(h.DevicePackages))
 	mux.HandleFunc("GET /devices/{serial}/logcat", h.requireAuth(h.LogcatPage))
 	mux.HandleFunc("GET /devices/{serial}/logcat/entries", h.requireAuth(h.LogcatRefresh))
+	mux.HandleFunc("GET /devices/{serial}/logcat/events", h.requireAuth(h.LogcatEvents))
 	mux.HandleFunc("POST /devices/{serial}/logcat", h.requireAuth(h.LogcatRequestCreate))
 
 	mux.HandleFunc("GET /groups", h.requireAuth(h.GroupList))
@@ -1906,23 +2497,30 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /commands", h.requireAuth(h.CommandCreate))
 	mux.HandleFunc("GET /commands/{id}", h.requireAuth(h.CommandDetail))
 	mux.HandleFunc("GET /commands/{id}/status", h.requireAuth(h.CommandStatusPartial))
+	mux.HandleFunc("GET /commands/{id}/events", h.requireAuth(h.CommandEvents))
 	mux.HandleFunc("POST /commands/{id}/delete", h.requireAuth(h.CommandDelete))
+	mux.HandleFunc("POST /commands/{id}/resend", h.requireAuth(h.CommandResendAll))
+	mux.HandleFunc("POST /commands/{id}/resend/{serial}", h.requireAuth(h.CommandResendDevice))
 
 	mux.HandleFunc("GET /settings", h.requireAuth(h.SettingsPage))
 	mux.HandleFunc("POST /settings/columns/add", h.requireAuth(h.SettingsAddColumn))
 	mux.HandleFunc("POST /settings/columns/{key}/remove", h.requireAuth(h.SettingsRemoveColumn))
 	mux.HandleFunc("POST /settings/legacy-checkin/toggle", h.requireAuth(h.SettingsToggleLegacyCheckin))
+	mux.HandleFunc("POST /settings/checkin-interval", h.requireAuth(h.SettingsSetCheckinInterval))
 
 	mux.HandleFunc("GET /setup", h.requireAuth(h.SetupPage))
 	mux.HandleFunc("POST /setup/apps", h.requireAuth(h.SetupCreateApp))
 	mux.HandleFunc("POST /setup/apps/create", h.requireAuth(h.SetupCreateAppJSON))
 	mux.HandleFunc("POST /setup/apps/{id}/delete", h.requireAuth(h.SetupDeleteApp))
 
-	mux.HandleFunc("GET /updates", h.requireAuth(h.Updates))
-	mux.HandleFunc("POST /updates", h.requireAuth(h.UpdateCreate))
-	mux.HandleFunc("GET /updates/{id}", h.requireAuth(h.UpdateDetail))
-	mux.HandleFunc("POST /updates/{id}/send", h.requireAuth(h.UpdateSend))
-	mux.HandleFunc("POST /updates/{id}/delete", h.requireAuth(h.UpdateDelete))
+	mux.HandleFunc("GET /updates", h.requireAuth(h.OTAPackages))
+	mux.HandleFunc("POST /updates", h.requireAuth(h.OTAPackageCreate))
+	mux.HandleFunc("GET /updates/{id}", h.requireAuth(h.OTAPackageDetail))
+	mux.HandleFunc("POST /updates/{id}/yank", h.requireAuth(h.OTAPackageYank))
+	mux.HandleFunc("POST /updates/{id}/delete", h.requireAuth(h.OTAPackageDelete))
+	mux.HandleFunc("POST /updates/{id}/deploy", h.requireAuth(h.OTAPackageDeploy))
+	mux.HandleFunc("GET /updates/{id}/deployments/{did}", h.requireAuth(h.DeploymentDetail))
+	mux.HandleFunc("POST /updates/{id}/deployments/{did}/delete", h.requireAuth(h.DeploymentDelete))
 
 	// Command output SSE
 	mux.HandleFunc("GET /commands/{id}/output/{serial}/stream", h.requireAuth(h.CommandOutputStream))

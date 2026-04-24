@@ -22,11 +22,40 @@ var upgrader = websocket.Upgrader{
 	CheckOrigin:     func(r *http.Request) bool { return true },
 }
 
+// PresenceEvent is emitted when a device connects or disconnects.
+type PresenceEvent struct {
+	DeviceID uuid.UUID
+	Online   bool
+}
+
+// DeviceUpdateEvent is emitted when dashboard-visible device data changes.
+type DeviceUpdateEvent struct {
+	DeviceID uuid.UUID
+}
+
+// CommandUpdateEvent is emitted when a command delivery status changes.
+type CommandUpdateEvent struct {
+	CommandID uuid.UUID
+}
+
+// LogcatUpdateEvent is emitted when a logcat result is received for a device.
+type LogcatUpdateEvent struct {
+	DeviceID uuid.UUID
+}
+
 // Hub maintains the set of active WebSocket clients keyed by device ID.
 type Hub struct {
-	mu        sync.RWMutex
-	clients   map[uuid.UUID]*Client
-	onMessage func(deviceID uuid.UUID, msg []byte)
+	mu             sync.RWMutex
+	clients        map[uuid.UUID]*Client
+	onMessage      func(deviceID uuid.UUID, msg []byte)
+	subMu          sync.RWMutex
+	subscribers    map[chan PresenceEvent]struct{}
+	updateMu       sync.RWMutex
+	updates        map[chan DeviceUpdateEvent]struct{}
+	cmdMu          sync.RWMutex
+	cmdUpdates     map[chan CommandUpdateEvent]struct{}
+	logcatMu       sync.RWMutex
+	logcatUpdates  map[chan LogcatUpdateEvent]struct{}
 }
 
 // SetOnMessage registers a function that is called for every message received
@@ -44,7 +73,141 @@ type Client struct {
 }
 
 func NewHub() *Hub {
-	return &Hub{clients: make(map[uuid.UUID]*Client)}
+	return &Hub{
+		clients:       make(map[uuid.UUID]*Client),
+		subscribers:   make(map[chan PresenceEvent]struct{}),
+		updates:       make(map[chan DeviceUpdateEvent]struct{}),
+		cmdUpdates:    make(map[chan CommandUpdateEvent]struct{}),
+		logcatUpdates: make(map[chan LogcatUpdateEvent]struct{}),
+	}
+}
+
+// SubscribeCommandUpdates returns a channel that receives command update events.
+func (h *Hub) SubscribeCommandUpdates() chan CommandUpdateEvent {
+	ch := make(chan CommandUpdateEvent, 32)
+	h.cmdMu.Lock()
+	h.cmdUpdates[ch] = struct{}{}
+	h.cmdMu.Unlock()
+	return ch
+}
+
+// UnsubscribeCommandUpdates closes the channel and removes it from the subscriber set.
+func (h *Hub) UnsubscribeCommandUpdates(ch chan CommandUpdateEvent) {
+	h.cmdMu.Lock()
+	if _, ok := h.cmdUpdates[ch]; ok {
+		delete(h.cmdUpdates, ch)
+		close(ch)
+	}
+	h.cmdMu.Unlock()
+}
+
+// PublishCommandUpdate notifies subscribers that a command delivery changed.
+func (h *Hub) PublishCommandUpdate(commandID uuid.UUID) {
+	ev := CommandUpdateEvent{CommandID: commandID}
+	h.cmdMu.RLock()
+	defer h.cmdMu.RUnlock()
+	for ch := range h.cmdUpdates {
+		select {
+		case ch <- ev:
+		default:
+		}
+	}
+}
+
+// SubscribeLogcatUpdates returns a channel that receives logcat update events.
+func (h *Hub) SubscribeLogcatUpdates() chan LogcatUpdateEvent {
+	ch := make(chan LogcatUpdateEvent, 32)
+	h.logcatMu.Lock()
+	h.logcatUpdates[ch] = struct{}{}
+	h.logcatMu.Unlock()
+	return ch
+}
+
+// UnsubscribeLogcatUpdates closes the channel and removes it from the subscriber set.
+func (h *Hub) UnsubscribeLogcatUpdates(ch chan LogcatUpdateEvent) {
+	h.logcatMu.Lock()
+	if _, ok := h.logcatUpdates[ch]; ok {
+		delete(h.logcatUpdates, ch)
+		close(ch)
+	}
+	h.logcatMu.Unlock()
+}
+
+// PublishLogcatUpdate notifies subscribers that a logcat result arrived for a device.
+func (h *Hub) PublishLogcatUpdate(deviceID uuid.UUID) {
+	ev := LogcatUpdateEvent{DeviceID: deviceID}
+	h.logcatMu.RLock()
+	defer h.logcatMu.RUnlock()
+	for ch := range h.logcatUpdates {
+		select {
+		case ch <- ev:
+		default:
+		}
+	}
+}
+
+// SubscribePresence returns a channel that receives presence events for all devices.
+// Callers must invoke UnsubscribePresence to release resources.
+func (h *Hub) SubscribePresence() chan PresenceEvent {
+	ch := make(chan PresenceEvent, 32)
+	h.subMu.Lock()
+	h.subscribers[ch] = struct{}{}
+	h.subMu.Unlock()
+	return ch
+}
+
+// UnsubscribePresence closes the channel and removes it from the subscriber set.
+func (h *Hub) UnsubscribePresence(ch chan PresenceEvent) {
+	h.subMu.Lock()
+	if _, ok := h.subscribers[ch]; ok {
+		delete(h.subscribers, ch)
+		close(ch)
+	}
+	h.subMu.Unlock()
+}
+
+// SubscribeDeviceUpdates returns a channel that receives device update events.
+// Callers must invoke UnsubscribeDeviceUpdates to release resources.
+func (h *Hub) SubscribeDeviceUpdates() chan DeviceUpdateEvent {
+	ch := make(chan DeviceUpdateEvent, 64)
+	h.updateMu.Lock()
+	h.updates[ch] = struct{}{}
+	h.updateMu.Unlock()
+	return ch
+}
+
+// UnsubscribeDeviceUpdates closes the channel and removes it from the subscriber set.
+func (h *Hub) UnsubscribeDeviceUpdates(ch chan DeviceUpdateEvent) {
+	h.updateMu.Lock()
+	if _, ok := h.updates[ch]; ok {
+		delete(h.updates, ch)
+		close(ch)
+	}
+	h.updateMu.Unlock()
+}
+
+func (h *Hub) publishPresence(ev PresenceEvent) {
+	h.subMu.RLock()
+	defer h.subMu.RUnlock()
+	for ch := range h.subscribers {
+		select {
+		case ch <- ev:
+		default:
+		}
+	}
+}
+
+// PublishDeviceUpdate notifies dashboard subscribers that a device changed.
+func (h *Hub) PublishDeviceUpdate(deviceID uuid.UUID) {
+	ev := DeviceUpdateEvent{DeviceID: deviceID}
+	h.updateMu.RLock()
+	defer h.updateMu.RUnlock()
+	for ch := range h.updates {
+		select {
+		case ch <- ev:
+		default:
+		}
+	}
 }
 
 func (h *Hub) register(c *Client) {
@@ -55,15 +218,21 @@ func (h *Hub) register(c *Client) {
 	h.clients[c.DeviceID] = c
 	h.mu.Unlock()
 	log.Printf("[ws] connected: %s", c.DeviceID)
+	h.publishPresence(PresenceEvent{DeviceID: c.DeviceID, Online: true})
 }
 
 func (h *Hub) Unregister(c *Client) {
 	h.mu.Lock()
+	removed := false
 	if cur, ok := h.clients[c.DeviceID]; ok && cur == c {
 		delete(h.clients, c.DeviceID)
+		removed = true
 	}
 	h.mu.Unlock()
 	log.Printf("[ws] disconnected: %s", c.DeviceID)
+	if removed {
+		h.publishPresence(PresenceEvent{DeviceID: c.DeviceID, Online: false})
+	}
 }
 
 // Push sends msg to a specific device. Returns true if the device is connected.

@@ -64,24 +64,29 @@ type Group struct {
 }
 
 type OTAPackage struct {
-	ID            int       `json:"id"`
-	Type          string    `json:"type"`            // "full" or "incremental"
-	TargetBuildID string    `json:"target_build_id"` // build ID after update
-	SourceBuildID string    `json:"source_build_id"` // build ID before update (incremental only)
-	ReleaseDate   time.Time `json:"release_date"`
-	UpdateURL     string    `json:"update_url"`
-	CreatedAt     time.Time `json:"created_at"`
+	ID              int       `json:"id"`
+	Type            string    `json:"type"`            // "full" or "incremental"
+	TargetBuildID   string    `json:"target_build_id"`
+	SourceBuildID   string    `json:"source_build_id"` // incremental only
+	ReleaseDate     time.Time `json:"release_date"`
+	UpdateURL       string    `json:"update_url"`
+	Changelog       string    `json:"changelog"`
+	Status          string    `json:"status"` // "active" or "yanked"
+	CreatedAt       time.Time `json:"created_at"`
+	DeploymentCount int       `json:"deployment_count,omitempty"` // populated by ListOTAPackages
 }
 
 type Update struct {
-	ID             int         `json:"id"`
-	OtaPackageID   int         `json:"ota_package_id"`
-	RebootBehavior string      `json:"reboot_behavior"`  // "immediate", "scheduled", "manual"
-	ScheduledTime  *time.Time  `json:"scheduled_time"`   // when reboot_behavior is "scheduled"
-	Status         string      `json:"status"`            // "pending", "active", "complete"
-	CreatedAt      time.Time   `json:"created_at"`
-	OtaPackage     *OTAPackage `json:"ota_package,omitempty"` // joined
-	Targets        []UpdateTarget `json:"targets,omitempty"`   // joined
+	ID              int            `json:"id"`
+	OtaPackageID    int            `json:"ota_package_id"`
+	RebootBehavior  string         `json:"reboot_behavior"` // "immediate", "scheduled", "manual"
+	ScheduledTime   *time.Time     `json:"scheduled_time"`
+	Status          string         `json:"status"` // "pending", "active", "complete"
+	CreatedAt       time.Time      `json:"created_at"`
+	OtaPackage      *OTAPackage    `json:"ota_package,omitempty"`
+	Targets         []UpdateTarget `json:"targets,omitempty"`
+	DeviceTotal     int            `json:"device_total,omitempty"`     // populated by ListDeploymentsByPackage
+	DeviceInstalled int            `json:"device_installed,omitempty"` // populated by ListDeploymentsByPackage
 }
 
 type UpdateTarget struct {
@@ -119,12 +124,13 @@ type CommandDelivery struct {
 
 // DeviceFilter holds optional filter parameters for device listing.
 type DeviceFilter struct {
-	Search  string    // search by serial/build (ILIKE)
-	GroupID uuid.UUID // filter by group membership (uuid.Nil = no filter)
-	Online  string    // "online", "offline", or "" (no filter)
-	BuildID string    // exact build_id match, or "" (no filter)
-	Battery string    // "low" (<20%), "mid" (20-49%), "ok" (>=50%), or "" (no filter)
-	Hidden  string    // "include" (show all), "only" (hidden only), or "" (active only)
+	Search               string    // search by serial/build (ILIKE)
+	GroupID              uuid.UUID // filter by group membership (uuid.Nil = no filter)
+	Online               string    // "online", "offline", or "" (no filter)
+	BuildID              string    // exact build_id match, or "" (no filter)
+	Battery              string    // "low" (<20%), "mid" (20-49%), "ok" (>=50%), or "" (no filter)
+	Hidden               string    // "include" (show all), "only" (hidden only), or "" (active only)
+	ActiveThresholdSecs  int       // seconds before a device is considered offline (0 = default 180)
 }
 
 type DB struct {
@@ -193,7 +199,10 @@ func (d *DB) UpsertCheckin(ctx context.Context, serial, buildID string, batteryP
 	return deviceID, pollIntervalMs, tx.Commit(ctx)
 }
 
-func (d *DB) GetSummary(ctx context.Context) (Summary, error) {
+func (d *DB) GetSummary(ctx context.Context, activeSecs int) (Summary, error) {
+	if activeSecs <= 0 {
+		activeSecs = 180
+	}
 	var s Summary
 	err := d.pool.QueryRow(ctx, `
 		WITH latest AS (
@@ -204,7 +213,7 @@ func (d *DB) GetSummary(ctx context.Context) (Summary, error) {
 		)
 		SELECT
 			COUNT(d.id),
-			COUNT(*) FILTER (WHERE d.last_seen_at > NOW() - INTERVAL '3 minutes'),
+			COUNT(*) FILTER (WHERE d.last_seen_at > NOW() - ($1 * INTERVAL '1 second')),
 			COUNT(*) FILTER (WHERE l.battery_pct < 20),
 			COUNT(DISTINCT d.build_id),
 			COUNT(*) FILTER (WHERE dc.kiosk_enabled = true)
@@ -212,7 +221,7 @@ func (d *DB) GetSummary(ctx context.Context) (Summary, error) {
 		LEFT JOIN latest l ON l.device_id = d.id
 		LEFT JOIN device_config dc ON dc.device_id = d.id
 		WHERE NOT d.hidden
-	`).Scan(&s.Total, &s.RecentlyActive, &s.LowBattery, &s.UniqueBuilds, &s.KioskCount)
+	`, activeSecs).Scan(&s.Total, &s.RecentlyActive, &s.LowBattery, &s.UniqueBuilds, &s.KioskCount)
 	return s, err
 }
 
@@ -271,10 +280,18 @@ func (d *DB) buildDeviceQuery(f DeviceFilter, sort, dir string, selectRows bool,
 		argN++
 	}
 
-	if f.Online == "online" {
-		wheres = append(wheres, "d.last_seen_at > NOW() - INTERVAL '3 minutes'")
-	} else if f.Online == "offline" {
-		wheres = append(wheres, "d.last_seen_at <= NOW() - INTERVAL '3 minutes'")
+	if f.Online == "online" || f.Online == "offline" {
+		threshold := f.ActiveThresholdSecs
+		if threshold <= 0 {
+			threshold = 180
+		}
+		args = append(args, threshold)
+		if f.Online == "online" {
+			wheres = append(wheres, fmt.Sprintf("d.last_seen_at > NOW() - ($%d * INTERVAL '1 second')", argN))
+		} else {
+			wheres = append(wheres, fmt.Sprintf("d.last_seen_at <= NOW() - ($%d * INTERVAL '1 second')", argN))
+		}
+		argN++
 	}
 
 	if f.BuildID != "" {
@@ -522,6 +539,33 @@ func (d *DB) GetDevice(ctx context.Context, serial string) (*Device, error) {
 	return &dev, nil
 }
 
+// GetDeviceByID fetches a single device by its UUID.
+func (d *DB) GetDeviceByID(ctx context.Context, id uuid.UUID) (*Device, error) {
+	var dev Device
+	err := d.pool.QueryRow(ctx, `
+		SELECT
+			d.id, d.serial_number, d.build_id, d.last_seen_at, d.created_at,
+			COALESCE(c.battery_pct, 0) AS battery_pct,
+			d.poll_interval_ms,
+			COALESCE(dc.kiosk_enabled, false),
+			COALESCE(dc.kiosk_package, ''),
+			COALESCE(c.extra, '{}'::jsonb) AS latest_extra
+		FROM devices d
+		LEFT JOIN LATERAL (
+			SELECT battery_pct, extra FROM checkins
+			WHERE device_id = d.id
+			ORDER BY created_at DESC
+			LIMIT 1
+		) c ON true
+		LEFT JOIN device_config dc ON dc.device_id = d.id
+		WHERE d.id = $1
+	`, id).Scan(&dev.ID, &dev.SerialNumber, &dev.BuildID, &dev.LastSeenAt, &dev.CreatedAt, &dev.BatteryPct, &dev.PollIntervalMs, &dev.KioskEnabled, &dev.KioskPackage, &dev.LatestExtra)
+	if err != nil {
+		return nil, fmt.Errorf("device not found: %w", err)
+	}
+	return &dev, nil
+}
+
 // HideDevice marks a device as hidden. It stays in the DB but is excluded from
 // listings and summaries. The flag is cleared automatically on the next check-in.
 func (d *DB) HideDevice(ctx context.Context, serial string) error {
@@ -539,6 +583,19 @@ func (d *DB) SetDevicePollInterval(ctx context.Context, serial string, intervalM
 		UPDATE devices SET poll_interval_ms = $2 WHERE serial_number = $1
 	`, serial, intervalMs)
 	return err
+}
+
+func (d *DB) GetLatestCheckin(ctx context.Context, deviceID uuid.UUID) (*Checkin, error) {
+	var c Checkin
+	err := d.pool.QueryRow(ctx, `
+		SELECT id, device_id, battery_pct, build_id, extra, created_at
+		FROM checkins WHERE device_id = $1
+		ORDER BY created_at DESC LIMIT 1
+	`, deviceID).Scan(&c.ID, &c.DeviceID, &c.BatteryPct, &c.BuildID, &c.Extra, &c.CreatedAt)
+	if err != nil {
+		return nil, err
+	}
+	return &c, nil
 }
 
 func (d *DB) GetCheckins(ctx context.Context, deviceID uuid.UUID, limit int) ([]Checkin, error) {
@@ -847,6 +904,24 @@ func (d *DB) GetDeviceIDsBySerials(ctx context.Context, serials []string) ([]uui
 	return ids, rows.Err()
 }
 
+// GetAllDeviceIDs returns the IDs of every registered device.
+func (d *DB) GetAllDeviceIDs(ctx context.Context) ([]uuid.UUID, error) {
+	rows, err := d.pool.Query(ctx, `SELECT id FROM devices`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ids []uuid.UUID
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
+
 // ── Commands ──────────────────────────────────────────────────────────────────
 
 // CreateCommand creates a command. For target_type "devices", targetIDs are device UUIDs.
@@ -919,6 +994,24 @@ func (d *DB) GetCommand(ctx context.Context, id uuid.UUID) (*Command, error) {
 		return nil, err
 	}
 	return &c, nil
+}
+
+// GetCommandTargetIDs returns the target UUIDs stored in command_targets for a command.
+func (d *DB) GetCommandTargetIDs(ctx context.Context, commandID uuid.UUID) ([]uuid.UUID, error) {
+	rows, err := d.pool.Query(ctx, `SELECT target_id FROM command_targets WHERE command_id = $1`, commandID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ids []uuid.UUID
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
 }
 
 // GetPendingCommandsForDevice returns commands not yet delivered/acked for this device.
@@ -1560,8 +1653,10 @@ CREATE TABLE IF NOT EXISTS apps (
 );
 
 CREATE INDEX IF NOT EXISTS idx_checkins_device_id  ON checkins(device_id);
+CREATE INDEX IF NOT EXISTS idx_checkins_device_created_at ON checkins(device_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_checkins_created_at ON checkins(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_devices_last_seen   ON devices(last_seen_at DESC);
+CREATE INDEX IF NOT EXISTS idx_device_groups_group_id_device_id ON device_groups(group_id, device_id);
 
 CREATE TABLE IF NOT EXISTS logcat_requests (
 	id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -1666,26 +1761,32 @@ CREATE TABLE IF NOT EXISTS update_devices (
 );
 
 ALTER TABLE devices ADD COLUMN IF NOT EXISTS hidden BOOLEAN NOT NULL DEFAULT false;
+
+ALTER TABLE ota_packages ADD COLUMN IF NOT EXISTS changelog TEXT NOT NULL DEFAULT '';
+ALTER TABLE ota_packages ADD COLUMN IF NOT EXISTS status    TEXT NOT NULL DEFAULT 'active';
 `
 
 // ── OTA Packages ──────────────────────────────────────────────────────────────
 
-func (d *DB) CreateOTAPackage(ctx context.Context, typ, targetBuildID, sourceBuildID, updateURL string, releaseDate time.Time) (*OTAPackage, error) {
+func (d *DB) CreateOTAPackage(ctx context.Context, typ, targetBuildID, sourceBuildID, updateURL, changelog string, releaseDate time.Time) (*OTAPackage, error) {
 	var p OTAPackage
 	err := d.pool.QueryRow(ctx, `
-		INSERT INTO ota_packages (type, target_build_id, source_build_id, build_id, update_url, release_date)
-		VALUES ($1, $2, $3, $2, $4, $5)
-		RETURNING id, type, target_build_id, source_build_id, release_date, update_url, created_at
-	`, typ, targetBuildID, sourceBuildID, updateURL, releaseDate).
-		Scan(&p.ID, &p.Type, &p.TargetBuildID, &p.SourceBuildID, &p.ReleaseDate, &p.UpdateURL, &p.CreatedAt)
+		INSERT INTO ota_packages (type, target_build_id, source_build_id, build_id, update_url, changelog, release_date)
+		VALUES ($1, $2, $3, $2, $4, $5, $6)
+		RETURNING id, type, target_build_id, source_build_id, release_date, update_url, changelog, status, created_at
+	`, typ, targetBuildID, sourceBuildID, updateURL, changelog, releaseDate).
+		Scan(&p.ID, &p.Type, &p.TargetBuildID, &p.SourceBuildID, &p.ReleaseDate, &p.UpdateURL, &p.Changelog, &p.Status, &p.CreatedAt)
 	return &p, err
 }
 
 func (d *DB) ListOTAPackages(ctx context.Context) ([]OTAPackage, error) {
 	rows, err := d.pool.Query(ctx, `
-		SELECT id, type, target_build_id, source_build_id, release_date, update_url, created_at
-		FROM ota_packages
-		ORDER BY release_date DESC
+		SELECT p.id, p.type, p.target_build_id, p.source_build_id, p.release_date, p.update_url, p.changelog, p.status, p.created_at,
+		       COUNT(u.id) AS deployment_count
+		FROM ota_packages p
+		LEFT JOIN updates u ON u.ota_package_id = p.id
+		GROUP BY p.id
+		ORDER BY p.created_at DESC
 	`)
 	if err != nil {
 		return nil, err
@@ -1695,7 +1796,7 @@ func (d *DB) ListOTAPackages(ctx context.Context) ([]OTAPackage, error) {
 	var out []OTAPackage
 	for rows.Next() {
 		var p OTAPackage
-		if err := rows.Scan(&p.ID, &p.Type, &p.TargetBuildID, &p.SourceBuildID, &p.ReleaseDate, &p.UpdateURL, &p.CreatedAt); err != nil {
+		if err := rows.Scan(&p.ID, &p.Type, &p.TargetBuildID, &p.SourceBuildID, &p.ReleaseDate, &p.UpdateURL, &p.Changelog, &p.Status, &p.CreatedAt, &p.DeploymentCount); err != nil {
 			return nil, err
 		}
 		out = append(out, p)
@@ -1703,12 +1804,33 @@ func (d *DB) ListOTAPackages(ctx context.Context) ([]OTAPackage, error) {
 	return out, rows.Err()
 }
 
+func (d *DB) GetOTAPackage(ctx context.Context, id int) (*OTAPackage, error) {
+	var p OTAPackage
+	err := d.pool.QueryRow(ctx, `
+		SELECT p.id, p.type, p.target_build_id, p.source_build_id, p.release_date, p.update_url, p.changelog, p.status, p.created_at,
+		       COUNT(u.id) AS deployment_count
+		FROM ota_packages p
+		LEFT JOIN updates u ON u.ota_package_id = p.id
+		WHERE p.id = $1
+		GROUP BY p.id
+	`, id).Scan(&p.ID, &p.Type, &p.TargetBuildID, &p.SourceBuildID, &p.ReleaseDate, &p.UpdateURL, &p.Changelog, &p.Status, &p.CreatedAt, &p.DeploymentCount)
+	if err != nil {
+		return nil, err
+	}
+	return &p, nil
+}
+
+func (d *DB) SetOTAPackageStatus(ctx context.Context, id int, status string) error {
+	_, err := d.pool.Exec(ctx, `UPDATE ota_packages SET status = $2 WHERE id = $1`, id, status)
+	return err
+}
+
 func (d *DB) DeleteOTAPackage(ctx context.Context, id int) error {
 	_, err := d.pool.Exec(ctx, `DELETE FROM ota_packages WHERE id = $1`, id)
 	return err
 }
 
-// ── Updates ──────────────────────────────────────────────────────────────────
+// ── Updates (Deployments) ─────────────────────────────────────────────────────
 
 func (d *DB) CreateUpdate(ctx context.Context, otaPackageID int, rebootBehavior string, scheduledTime *time.Time) (*Update, error) {
 	var u Update
@@ -1721,10 +1843,38 @@ func (d *DB) CreateUpdate(ctx context.Context, otaPackageID int, rebootBehavior 
 	return &u, err
 }
 
+func (d *DB) ListDeploymentsByPackage(ctx context.Context, pkgID int) ([]Update, error) {
+	rows, err := d.pool.Query(ctx, `
+		SELECT u.id, u.ota_package_id, u.reboot_behavior, u.scheduled_time, u.status, u.created_at,
+		       COUNT(ud.device_id) AS device_total,
+		       COUNT(CASE WHEN ud.status = 'installed' THEN 1 END) AS device_installed
+		FROM updates u
+		LEFT JOIN update_devices ud ON ud.update_id = u.id
+		WHERE u.ota_package_id = $1
+		GROUP BY u.id
+		ORDER BY u.created_at DESC
+	`, pkgID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []Update
+	for rows.Next() {
+		var u Update
+		if err := rows.Scan(&u.ID, &u.OtaPackageID, &u.RebootBehavior, &u.ScheduledTime, &u.Status, &u.CreatedAt,
+			&u.DeviceTotal, &u.DeviceInstalled); err != nil {
+			return nil, err
+		}
+		out = append(out, u)
+	}
+	return out, rows.Err()
+}
+
 func (d *DB) ListUpdates(ctx context.Context) ([]Update, error) {
 	rows, err := d.pool.Query(ctx, `
 		SELECT u.id, u.ota_package_id, u.reboot_behavior, u.scheduled_time, u.status, u.created_at,
-		       p.id, p.type, p.target_build_id, p.source_build_id, p.release_date, p.update_url, p.created_at
+		       p.id, p.type, p.target_build_id, p.source_build_id, p.release_date, p.update_url, p.changelog, p.status, p.created_at
 		FROM updates u
 		JOIN ota_packages p ON p.id = u.ota_package_id
 		ORDER BY u.created_at DESC
@@ -1739,7 +1889,7 @@ func (d *DB) ListUpdates(ctx context.Context) ([]Update, error) {
 		var u Update
 		var p OTAPackage
 		if err := rows.Scan(&u.ID, &u.OtaPackageID, &u.RebootBehavior, &u.ScheduledTime, &u.Status, &u.CreatedAt,
-			&p.ID, &p.Type, &p.TargetBuildID, &p.SourceBuildID, &p.ReleaseDate, &p.UpdateURL, &p.CreatedAt); err != nil {
+			&p.ID, &p.Type, &p.TargetBuildID, &p.SourceBuildID, &p.ReleaseDate, &p.UpdateURL, &p.Changelog, &p.Status, &p.CreatedAt); err != nil {
 			return nil, err
 		}
 		u.OtaPackage = &p
@@ -1753,12 +1903,12 @@ func (d *DB) GetUpdate(ctx context.Context, id int) (*Update, error) {
 	var p OTAPackage
 	err := d.pool.QueryRow(ctx, `
 		SELECT u.id, u.ota_package_id, u.reboot_behavior, u.scheduled_time, u.status, u.created_at,
-		       p.id, p.type, p.target_build_id, p.source_build_id, p.release_date, p.update_url, p.created_at
+		       p.id, p.type, p.target_build_id, p.source_build_id, p.release_date, p.update_url, p.changelog, p.status, p.created_at
 		FROM updates u
 		JOIN ota_packages p ON p.id = u.ota_package_id
 		WHERE u.id = $1
 	`, id).Scan(&u.ID, &u.OtaPackageID, &u.RebootBehavior, &u.ScheduledTime, &u.Status, &u.CreatedAt,
-		&p.ID, &p.Type, &p.TargetBuildID, &p.SourceBuildID, &p.ReleaseDate, &p.UpdateURL, &p.CreatedAt)
+		&p.ID, &p.Type, &p.TargetBuildID, &p.SourceBuildID, &p.ReleaseDate, &p.UpdateURL, &p.Changelog, &p.Status, &p.CreatedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -1805,15 +1955,15 @@ func (d *DB) ResolveUpdateForDevice(ctx context.Context, deviceID uuid.UUID) (*U
 	var p OTAPackage
 	err := d.pool.QueryRow(ctx, `
 		SELECT u.id, u.ota_package_id, u.reboot_behavior, u.scheduled_time, u.status, u.created_at,
-		       p.id, p.type, p.target_build_id, p.source_build_id, p.release_date, p.update_url, p.created_at
+		       p.id, p.type, p.target_build_id, p.source_build_id, p.release_date, p.update_url, p.changelog, p.status, p.created_at
 		FROM update_devices ud
 		JOIN updates u ON u.id = ud.update_id
 		JOIN ota_packages p ON p.id = u.ota_package_id
-		WHERE ud.device_id = $1 AND u.status = 'active' AND ud.status != 'installed'
+		WHERE ud.device_id = $1 AND u.status = 'active' AND ud.status != 'installed' AND p.status = 'active'
 		ORDER BY u.created_at DESC
 		LIMIT 1
 	`, deviceID).Scan(&u.ID, &u.OtaPackageID, &u.RebootBehavior, &u.ScheduledTime, &u.Status, &u.CreatedAt,
-		&p.ID, &p.Type, &p.TargetBuildID, &p.SourceBuildID, &p.ReleaseDate, &p.UpdateURL, &p.CreatedAt)
+		&p.ID, &p.Type, &p.TargetBuildID, &p.SourceBuildID, &p.ReleaseDate, &p.UpdateURL, &p.Changelog, &p.Status, &p.CreatedAt)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil

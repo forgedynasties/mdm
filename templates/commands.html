@@ -34,7 +34,7 @@
               <option value="{{.ApkURL}}">{{.Name}}</option>
               {{end}}
             </select>
-            <button type="button" class="btn-outline" onclick="openAppModal()">+ New App</button>
+            <button type="button" class="btn-outline btn-plus" onclick="openAppModal()" title="New App"><span class="ui-icon"><svg viewBox="0 0 24 24"><path d="M12 5v14"/><path d="M5 12h14"/></svg></span></button>
           </div>
         {{else}}
           <div class="app-empty-hint">
@@ -88,13 +88,30 @@
       <textarea name="target_serials" class="form-textarea" placeholder="One serial number per line&#10;DEVICE001&#10;DEVICE002"></textarea>
     </div>
 
-    <button type="submit" id="send-btn" class="btn-primary">Send Command</button>
+    <button type="submit" id="send-btn" class="btn-primary btn-send"><span class="ui-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 2 11 13"/><path d="M22 2 15 22 11 13 2 9z"/></svg></span>Send Command</button>
   </form>
 </div>
 
 <div class="card">
-  <div class="card-header"><h3>History</h3></div>
-  <table class="table">
+  <div class="card-header" style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;">
+    <h3>History</h3>
+    <div style="display:flex;gap:8px;align-items:center;">
+      <select id="filter-type" class="form-input" style="width:auto;padding:4px 8px;font-size:0.85rem;" onchange="filterCommands()">
+        <option value="">All Types</option>
+        <option value="install_apk">Install APK</option>
+        <option value="shell">Shell</option>
+        <option value="screenshot">Screenshot</option>
+        <option value="reboot">Reboot</option>
+      </select>
+      <select id="filter-target" class="form-input" style="width:auto;padding:4px 8px;font-size:0.85rem;" onchange="filterCommands()">
+        <option value="">All Targets</option>
+        <option value="all">All Devices</option>
+        <option value="devices">Devices</option>
+        <option value="groups">Groups</option>
+      </select>
+    </div>
+  </div>
+  <table class="table" id="cmd-history-table">
     <thead>
       <tr>
         <th>Type</th>
@@ -107,7 +124,7 @@
     <tbody>
       {{if .Commands}}
         {{range .Commands}}
-        <tr>
+        <tr data-cmd-type="{{.Type}}" data-cmd-target="{{.TargetType}}">
           <td><span class="status-badge muted">{{cmdLabel .Type}}</span></td>
           <td class="mono small muted">{{cmdDetail .}}</td>
           <td class="muted">{{.TargetType}}</td>
@@ -152,6 +169,16 @@
 </div>
 
 <script>
+function filterCommands() {
+  var ft = document.getElementById('filter-type').value;
+  var fg = document.getElementById('filter-target').value;
+  var rows = document.querySelectorAll('#cmd-history-table tbody tr[data-cmd-type]');
+  rows.forEach(function(r) {
+    var show = (!ft || r.dataset.cmdType === ft) && (!fg || r.dataset.cmdTarget === fg);
+    r.style.display = show ? '' : 'none';
+  });
+}
+
 function selectType(val, btn) {
   document.getElementById('cmd-type-input').value = val;
   document.querySelectorAll('.seg-control:first-of-type .seg-btn').forEach(b => b.classList.remove('active'));
